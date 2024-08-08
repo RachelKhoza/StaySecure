@@ -1,0 +1,17 @@
+
+version: '3.8'
+# Define the services (containers) that will be run
+services:
+  app:
+    build: .   # Build the Docker image using the Dockerfile in the current director
+    environment:  # Set environment variables for the container
+      DATABASE_URL: ${DATABASE_URL}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+    volumes: # Mount the current directory to /usr/src/app inside the containe
+      - .:/usr/src/app
+          # Command to be run when the container starts
+
+    # - Check if the PostgreSQL database is accessible at 'my-postgres' on port 5432
+    # - If not, sleep for 1 second and check again (repeat until succesful)
+    # ./start.sh - After PostgreL is accessible, then run the start.sh script
+    command: sh -c "while !</dev/tcp/my-postgres/5432; do sleep 1; done; ./start.sh"
