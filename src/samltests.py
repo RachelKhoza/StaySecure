@@ -9,7 +9,7 @@ JIRA_BASE_URL   = "https://<your-jira-domain>"
 XRAY_TOKEN      = "<YOUR_BEARER_TOKEN>"
 
 TEST_EXEC_KEY   = "HPCSVC-2922"
-TARGET_TEST_KEY = "HPCSVC-2003"
+TARGET_TEST_KEY = "HPCSVC-1971"    # or HPCSVC-2003, whichever you want
 
 LOCAL_FILE_NAME = "saml-configuration.png"
 CONTENT_TYPE    = "image/png"
@@ -25,12 +25,19 @@ def fetch_test_run_id(test_exec_key: str, test_key: str) -> int:
     resp = requests.get(url, headers=headers)
     if resp.status_code != 200:
         raise RuntimeError(
-            f"Failed to fetch tests for execution {test_exec_key}: "
-            f"{resp.status_code} → {resp.text}"
+            f"Failed to fetch tests for execution {test_exec_key}:\n"
+            f"  HTTP {resp.status_code} → {resp.text}"
         )
 
     data = resp.json()
-    # If Xray returns a dict, extract the array; otherwise data is already the list
+    # Data is a LIST of objects, each like:
+    # {
+    #   "id": 36841106,
+    #   "status": "TODO",
+    #   "archived": false,
+    #   "key": "HPCSVC-2003",
+    #   "rank": 1
+    # }
     if not isinstance(data, list):
         data = data.get("results", []) or data.get("values", [])
 
@@ -41,6 +48,7 @@ def fetch_test_run_id(test_exec_key: str, test_key: str) -> int:
     raise ValueError(
         f"Test key '{test_key}' not found in execution '{test_exec_key}'."
     )
+
 
 def upload_evidence_to_run(test_run_id: int, filename: str, content_type: str):
     if not os.path.isfile(filename):
@@ -62,12 +70,22 @@ def upload_evidence_to_run(test_run_id: int, filename: str, content_type: str):
         "Content-Type":  "application/json"
     }
     resp = requests.post(url, headers=headers, data=json.dumps(payload))
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Failed to upload evidence to run {test_run_id}: "
-            f"{resp.status_code} → {resp.text}"
-        )
-    return resp.json()
+
+    # Treat 200/201/204 as success
+    if resp.status_code in (200, 201, 204):
+        print(f"→ Attachment upload returned HTTP {resp.status_code}. Response body:")
+        print(f"'''{resp.text}'''")  # usually empty
+        if resp.headers.get("Content-Type", "").startswith("application/json") and resp.text.strip():
+            return resp.json()
+        else:
+            return None
+
+    # Any other status is an error
+    raise RuntimeError(
+        f"Failed to upload evidence to run {test_run_id}:\n"
+        f"  HTTP {resp.status_code} → {resp.text}"
+    )
+
 
 if __name__ == "__main__":
     try:
@@ -78,13 +96,16 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        response_json = upload_evidence_to_run(
+        result = upload_evidence_to_run(
             test_run_id=run_id,
             filename=LOCAL_FILE_NAME,
             content_type=CONTENT_TYPE
         )
-        print("✅ Evidence uploaded successfully. Response:")
-        print(json.dumps(response_json, indent=2))
+        if result is not None:
+            print("✅ Evidence uploaded successfully. JSON response:")
+            print(json.dumps(result, indent=2))
+        else:
+            print("✅ Evidence uploaded successfully (no JSON returned).")
     except Exception as e:
         print("❌ Error while uploading evidence:", e)
         sys.exit(1)
