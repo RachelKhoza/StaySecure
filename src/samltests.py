@@ -5,7 +5,7 @@ import os
 import sys
 
 # ─────────── CONFIGURATION ───────────
-JIRA_BASE_URL   = "https://<your-jira-domain>"   # e.g. "https://atc-int.yourcompany.net"
+JIRA_BASE_URL   = "https://<your-jira-domain>"
 XRAY_TOKEN      = "<YOUR_BEARER_TOKEN>"
 
 TEST_EXEC_KEY   = "HPCSVC-2922"
@@ -30,27 +30,17 @@ def fetch_test_run_id(test_exec_key: str, test_key: str) -> int:
         )
 
     data = resp.json()
+    # If Xray returns a dict, extract the array; otherwise data is already the list
+    if not isinstance(data, list):
+        data = data.get("results", []) or data.get("values", [])
 
-    # ─── DEBUG: see exactly what Xray returned ───
-    print("→ RAW JSON from Xray GET /testexec/{}/test :\n{}".format(
-        test_exec_key,
-        json.dumps(data, indent=2)
-    ))
-    # ───────────────────────────────────────────────
+    for entry in data:
+        if entry.get("key") == test_key:
+            return entry["id"]
 
-    # Handle either a top-level list or a dict-with-“results”:
-    if isinstance(data, list):
-        entries = data
-    else:
-        entries = data.get("results", []) or data.get("values", [])
-
-    for entry in entries:
-        # Try both common field‐names in case Xray’s version differs:
-        if entry.get("testIssueKey") == test_key or entry.get("testKey") == test_key:
-            return entry["testRunId"]
-
-    raise ValueError(f"Test key '{test_key}' not found in execution '{test_exec_key}'.")
-
+    raise ValueError(
+        f"Test key '{test_key}' not found in execution '{test_exec_key}'."
+    )
 
 def upload_evidence_to_run(test_run_id: int, filename: str, content_type: str):
     if not os.path.isfile(filename):
@@ -78,7 +68,6 @@ def upload_evidence_to_run(test_run_id: int, filename: str, content_type: str):
             f"{resp.status_code} → {resp.text}"
         )
     return resp.json()
-
 
 if __name__ == "__main__":
     try:
