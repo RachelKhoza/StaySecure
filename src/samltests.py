@@ -1,108 +1,116 @@
-import os
+import base64
 import json
 import requests
-from datetime import datetime, timezone
 
-# Inputs
-# Ensure XRAY_TOKEN is set as an environment variable
-xray_token = os.getenv("XRAY_TOKEN")
-if not xray_token:
-    print("Error: XRAY_TOKEN environment variable not set.")
-    exit()
+# ─────────── CONFIGURATION ───────────
+JIRA_BASE_URL    = "https://<your-jira-domain>"   # e.g. "https://atc-int.yourcompany.net"
+XRAY_USERNAME    = "<your-jira-username>"
+XRAY_API_TOKEN   = "<your-jira-api-token-or-password>"
 
-test_exec_key = "HPCSVC-2922"  # Your Test Execution Key
-test_key = "HPCSVC-2001"      # Your Test Key
-screenshot_file = "org_screenshot.png"  # Ensure this file exists
+TEST_EXEC_KEY    = "HPCSVC-2922"   # the Test Execution issue key
+TARGET_TEST_KEY  = "HPCSVC-2003"   # the Test (inside that execution) whose run we want
+LOCAL_FILE_PATH  = "/path/to/screenshot.png"
+UPLOAD_FILENAME  = "saml-configuration.png"
+CONTENT_TYPE     = "image/png"
+# ─────────────────────────────────────
 
-# Replace with your actual Jira base URL
-jira_base_url = "https://atc-int.YOUR_DOMAIN.net/jira"
-upload_url = f"{jira_base_url}/rest/raven/1.0/import/execution"
+def fetch_test_run_id(test_exec_key: str, test_key: str) -> int:
+    """
+    1. Calls GET /rest/raven/1.0/api/testexec/{testExecKey}/test
+    2. Finds the entry where testIssueKey == test_key
+    3. Returns its numeric testRunId
+    """
+    url = f"{JIRA_BASE_URL}/rest/raven/1.0/api/testexec/{test_exec_key}/test"
+    resp = requests.get(
+        url,
+        auth=(XRAY_USERNAME, XRAY_API_TOKEN),
+        headers={"Content-Type": "application/json"}
+    )
 
-# Header for authentication
-headers = {
-    "Authorization": f"Bearer {xray_token}"
-}
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Failed to fetch tests for execution {test_exec_key}: "
+            f"{resp.status_code} → {resp.text}"
+        )
 
-# Time formatting for Xray
-# Xray expects UTC time, usually in ISO 8601 format.
-# The +0000 offset explicitly denotes UTC.
-start_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+0000")
-finish_date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+0000")
+    data = resp.json()
+    # Example structure:
+    # {
+    #   "total": 2,
+    #   "results": [
+    #     {
+    #       "testIssueKey": "HPCSVC-2002",
+    #       "testExecIssueKey": "HPCSVC-2922",
+    #       "testRunId": 123450,
+    #       … 
+    #     },
+    #     {
+    #       "testIssueKey": "HPCSVC-2003",
+    #       "testExecIssueKey": "HPCSVC-2922",
+    #       "testRunId": 123456,
+    #       …
+    #     }
+    #   ]
+    # }
+    for entry in data.get("results", []):
+        if entry.get("testIssueKey") == test_key:
+            return entry["testRunId"]
 
-# Payload for Xray (Xray JSON format)
-# The 'filename' in evidences should be the basename of the file.
-actual_screenshot_basename = os.path.basename(screenshot_file)
+    raise ValueError(
+        f"Test key {test_key} not found in execution {test_exec_key}."
+    )
 
-xray_result = {
-    "testExecutionKey": test_exec_key,
-    "info": {
-        "summary": "Automated Execution via Python",
-        "description": "Test execution results and evidence uploaded using a Python script.",
-        "user": "automation_user", # Optional: specify the user if needed
-        "startDate": start_date,
-        "finishDate": finish_date
-        # You can add other info fields like "version", "testPlanKey", etc.
-    },
-    "tests": [
-        {
-            "testKey": test_key,
-            "start": start_date, # Optional: test-specific start date
-            "finish": finish_date, # Optional: test-specific finish date
-            "status": "PASS",  # Or FAIL, TODO, EXECUTING, etc.
-            "evidences": [
-                {
-                    "filename": actual_screenshot_basename,
-                    "contentType": "image/png"
-                    # For non-image files, adjust contentType accordingly (e.g., "text/plain", "application/pdf")
-                }
-            ]
-            # You can add "comment", "steps", "defects", "customFields", etc. here
-        }
-    ]
-}
+def upload_evidence_to_run(test_run_id: int, file_path: str, filename: str, content_type: str):
+    """
+    1. Reads the local file and base64-encodes it.
+    2. POSTS to /rest/raven/1.0/api/testrun/{testRunId}/attachment
+    """
+    # Read & encode:
+    with open(file_path, "rb") as f:
+        raw_bytes   = f.read()
+        b64_content = base64.b64encode(raw_bytes).decode("utf-8")
 
-# Write JSON payload to a file
-json_filename = "xray_result.json"
-try:
-    with open(json_filename, "w") as jf:
-        json.dump(xray_result, jf, indent=4) # Added indent for readability of the JSON file
-    print(f"Xray JSON payload written to {json_filename}")
-except IOError as e:
-    print(f"Error writing JSON to file {json_filename}: {e}")
-    exit()
+    payload = {
+        "data":        b64_content,
+        "filename":    filename,
+        "contentType": content_type
+    }
 
-# Upload JSON results and evidence file(s)
-try:
-    with open(json_filename, "rb") as result_file_handle, \
-         open(screenshot_file, "rb") as evidence_file_handle:
+    url = f"{JIRA_BASE_URL}/rest/raven/1.0/api/testrun/{test_run_id}/attachment"
+    resp = requests.post(
+        url,
+        auth=(XRAY_USERNAME, XRAY_API_TOKEN),
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(payload)
+    )
 
-        # Corrected 'files' dictionary structure
-        # - The JSON result part is commonly named "results"
-        # - The evidence file part name should match the 'filename' in the JSON payload
-        files_to_upload = {
-            "results": (json_filename, result_file_handle, "application/json"),
-            actual_screenshot_basename: (actual_screenshot_basename, evidence_file_handle, "image/png")
-        }
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Failed to upload evidence to run {test_run_id}: "
+            f"{resp.status_code} → {resp.text}"
+        )
 
-        print(f"Uploading to: {upload_url}")
-        print(f"Files to upload: {list(files_to_upload.keys())}")
+    return resp.json()
 
-        response = requests.post(upload_url, headers=headers, files=files_to_upload)
+if __name__ == "__main__":
+    # 1. Fetch the numeric testRunId for TEST_EXEC_KEY + TARGET_TEST_KEY
+    try:
+        run_id = fetch_test_run_id(TEST_EXEC_KEY, TARGET_TEST_KEY)
+        print(f"🔎 Found testRunId = {run_id} for test {TARGET_TEST_KEY}")
+    except Exception as e:
+        print("❌ Error while fetching testRunId:", e)
+        exit(1)
 
-        # Check response
-        if response.status_code == 200 or response.status_code == 201:
-            print(f"Successfully uploaded results and evidence for test execution {test_exec_key}.")
-            try:
-                print("Response from server:", response.json()) # Xray often returns info about the imported execution
-            except json.JSONDecodeError:
-                print("Response from server (non-JSON):", response.text)
-        else:
-            print(f"Error uploading to Xray. Status Code: {response.status_code}")
-            print("Response body:", response.text)
-
-except FileNotFoundError as e:
-    print(f"Error: File not found. Please ensure '{json_filename}' and '{screenshot_file}' exist. Details: {e}")
-except requests.exceptions.RequestException as e:
-    print(f"An error occurred during the web request: {e}")
-except Exception as e:
-    print(f"An unexpected error occurred: {e}")
+    # 2. Upload evidence (base64‐encoded) to that run:
+    try:
+        response_json = upload_evidence_to_run(
+            test_run_id=run_id,
+            file_path=LOCAL_FILE_PATH,
+            filename=UPLOAD_FILENAME,
+            content_type=CONTENT_TYPE
+        )
+        print("✅ Evidence uploaded successfully:")
+        print(json.dumps(response_json, indent=2))
+    except Exception as e:
+        print("❌ Error while uploading evidence:", e)
+        exit(1)
