@@ -8,26 +8,20 @@ import sys
 JIRA_BASE_URL   = "https://<your-jira-domain>"   # e.g. "https://atc-int.yourcompany.net"
 XRAY_TOKEN      = "<YOUR_BEARER_TOKEN>"
 
-TEST_EXEC_KEY   = "HPCSVC-2922"   # the Test Execution issue key
-TARGET_TEST_KEY = "HPCSVC-2003"   # the Test (inside that execution) whose run we want
+TEST_EXEC_KEY   = "HPCSVC-2922"
+TARGET_TEST_KEY = "HPCSVC-2003"
 
-# Just the filename (assumes the file is in the same directory as this script)
 LOCAL_FILE_NAME = "saml-configuration.png"
 CONTENT_TYPE    = "image/png"
 # ─────────────────────────────────────
 
-
 def fetch_test_run_id(test_exec_key: str, test_key: str) -> int:
-    """
-    1. Calls GET /rest/raven/1.0/api/testexec/{testExecKey}/test  
-    2. Since the response is a JSON array (list) of objects, we iterate over that list.  
-    3. Find the entry where entry["testIssueKey"] == test_key and return its numeric testRunId.
-    """
     url = f"{JIRA_BASE_URL}/rest/raven/1.0/api/testexec/{test_exec_key}/test"
     headers = {
         "Authorization": f"Bearer {XRAY_TOKEN}",
         "Content-Type":  "application/json"
     }
+
     resp = requests.get(url, headers=headers)
     if resp.status_code != 200:
         raise RuntimeError(
@@ -36,48 +30,32 @@ def fetch_test_run_id(test_exec_key: str, test_key: str) -> int:
         )
 
     data = resp.json()
-    # At this point, `data` is typically a list of objects like:
-    # [
-    #   {
-    #     "testIssueKey":    "HPCSVC-2002",
-    #     "testExecIssueKey": "HPCSVC-2922",
-    #     "testRunId":       123450,
-    #     … 
-    #   },
-    #   {
-    #     "testIssueKey":    "HPCSVC-2003",
-    #     "testExecIssueKey": "HPCSVC-2922",
-    #     "testRunId":       123456,
-    #     …
-    #   },
-    #   …
-    # ]
+
+    # ─── DEBUG: see exactly what Xray returned ───
+    print("→ RAW JSON from Xray GET /testexec/{}/test :\n{}".format(
+        test_exec_key,
+        json.dumps(data, indent=2)
+    ))
+    # ───────────────────────────────────────────────
+
+    # Handle either a top-level list or a dict-with-“results”:
     if isinstance(data, list):
         entries = data
     else:
-        # (defensive) if Xray ever returns a dict with "results": [...]
-        entries = data.get("results", [])
+        entries = data.get("results", []) or data.get("values", [])
 
     for entry in entries:
-        # key in each entry is exactly "testIssueKey" (case-sensitive)
-        if entry.get("testIssueKey") == test_key:
+        # Try both common field‐names in case Xray’s version differs:
+        if entry.get("testIssueKey") == test_key or entry.get("testKey") == test_key:
             return entry["testRunId"]
 
-    raise ValueError(
-        f"Test key '{test_key}' not found in execution '{test_exec_key}'."
-    )
+    raise ValueError(f"Test key '{test_key}' not found in execution '{test_exec_key}'.")
 
 
 def upload_evidence_to_run(test_run_id: int, filename: str, content_type: str):
-    """
-    1. Reads the local file (same directory) and base64-encodes it.
-    2. POSTS to /rest/raven/1.0/api/testrun/{testRunId}/attachment with Bearer auth.
-    """
-    # Ensure the file actually exists in the current working directory:
     if not os.path.isfile(filename):
         raise FileNotFoundError(f"Cannot find '{filename}' in {os.getcwd()}")
 
-    # Read & base64‐encode the file
     with open(filename, "rb") as f:
         raw_bytes   = f.read()
         b64_content = base64.b64encode(raw_bytes).decode("utf-8")
@@ -94,18 +72,15 @@ def upload_evidence_to_run(test_run_id: int, filename: str, content_type: str):
         "Content-Type":  "application/json"
     }
     resp = requests.post(url, headers=headers, data=json.dumps(payload))
-
     if resp.status_code != 200:
         raise RuntimeError(
             f"Failed to upload evidence to run {test_run_id}: "
             f"{resp.status_code} → {resp.text}"
         )
-
     return resp.json()
 
 
 if __name__ == "__main__":
-    # 1. Fetch the numeric testRunId for (TEST_EXEC_KEY + TARGET_TEST_KEY)
     try:
         run_id = fetch_test_run_id(TEST_EXEC_KEY, TARGET_TEST_KEY)
         print(f"🔎 Found testRunId = {run_id} for test '{TARGET_TEST_KEY}'")
@@ -113,7 +88,6 @@ if __name__ == "__main__":
         print("❌ Error while fetching testRunId:", e)
         sys.exit(1)
 
-    # 2. Upload evidence (base64‐encoded) to that run (uses ONLY the filename)
     try:
         response_json = upload_evidence_to_run(
             test_run_id=run_id,
