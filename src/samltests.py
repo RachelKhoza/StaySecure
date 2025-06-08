@@ -1,142 +1,102 @@
 #!/usr/bin/env python3
 import os
 import sys
-import time
-import random
+import json
 import base64
 import requests
 
-# ──────────────── Configuration ────────────────
+# ─────────────── Configuration ───────────────
 JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
 XRAY_TOKEN    = os.getenv("XRAY_TOKEN")
 
 if not JIRA_BASE_URL or not XRAY_TOKEN:
-    print("❌ Missing one of JIRA_BASE_URL or XRAY_TOKEN environment variables")
+    print("❌ Error: JIRA_BASE_URL and XRAY_TOKEN must be set in the environment")
     sys.exit(1)
 
+# ─────────────── Mapping ───────────────
+# For each test key, point to the file you want to attach and its MIME type.
+MAPPING = {
+    "HPCSVC-2003": ("filtered_settings/saml_settings_ansible_core.json", "application/json"),
+    "HPCSVC-2001": ("screenshots/screenshot.png",                   "image/png"),
+    # Add more testKey → (path, contentType) entries here as needed
+}
 
-def sleep_after(attempt: int, retry_after_header: str | None) -> float:
+
+def encode_file_to_b64(path: str) -> str:
+    """Read a file and return its Base64‐encoded contents."""
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def build_payload(test_exec_key: str) -> dict:
     """
-    Returns how many seconds to sleep based on:
-      - an explicit Retry-After header (if present & integer), or
-      - exponential back-off 1, 2, 4, 8… + 0–1s jitter
+    Construct the JSON payload for the Generic Import API:
+    - testExecutionKey: your dispatch input
+    - info: metadata about the import
+    - tests: one entry per testKey, each with its evidences array
     """
-    if retry_after_header:
-        try:
-            return int(retry_after_header)
-        except ValueError:
-            pass
-    base = 2 ** (attempt - 1)
-    return base + random.random()
+    tests = []
 
-
-def fetch_test_run_id(test_exec_key: str, test_key: str) -> int:
-    """
-    Fetch the numeric test-run ID for a given execution key + test key.
-    Retries on HTTP 429.
-    """
-    url = f"{JIRA_BASE_URL}/rest/raven/1.0/api/testexec/{test_exec_key}/test"
-    headers = {
-        "Authorization": f"Bearer {XRAY_TOKEN}",
-        "Content-Type":  "application/json",
-    }
-    max_retries = 5
-
-    for attempt in range(1, max_retries + 1):
-        resp = requests.get(url, headers=headers)
-        if resp.status_code == 200:
-            data = resp.json()
-            results = (
-                data
-                if isinstance(data, list)
-                else data.get("results", []) or data.get("values", [])
-            )
-            for entry in results:
-                if entry.get("key") == test_key:
-                    return entry["id"]
-            raise ValueError(f"Test key '{test_key}' not found in execution '{test_exec_key}'")
-
-        if resp.status_code == 429:
-            ra = resp.headers.get("Retry-After")
-            wait = sleep_after(attempt, ra)
-            print(f"⚠️ GET rate-limited (attempt {attempt}/{max_retries}), "
-                  f"Retry-After={ra!r}, sleeping {wait:.1f}s…")
-            time.sleep(wait)
+    for test_key, (path, mime) in MAPPING.items():
+        if not os.path.isfile(path):
+            print(f"⚠️  Skipping missing file for {test_key}: {path}")
             continue
 
-        # any other error: bail out
-        resp.raise_for_status()
+        b64data = encode_file_to_b64(path)
+        tests.append({
+            "testKey":   test_key,
+            "status":    "TODO",  # or "PASS"/"FAIL" if you know the outcome
+            "evidences": [
+                {
+                    "data":        b64data,
+                    "filename":    os.path.basename(path),
+                    "contentType": mime
+                }
+            ]
+        })
 
-    raise RuntimeError(f"Failed to fetch run ID after {max_retries} retries (last code {resp.status_code})")
-
-
-def upload_evidence(test_run_id: int, filename: str, content_type: str) -> None:
-    """
-    Upload a file or screenshot (base64‐encoded) to the given test run ID.
-    Retries on HTTP 429.
-    """
-    if not os.path.isfile(filename):
-        raise FileNotFoundError(f"Cannot find '{filename}'")
-
-    with open(filename, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("utf-8")
-
-    payload = {
-        "data":        b64,
-        "filename":    os.path.basename(filename),
-        "contentType": content_type,
+    return {
+        "testExecutionKey": test_exec_key,
+        "info": {
+            "summary":     f"Imported execution {test_exec_key}",
+            "description": "Automated import via Generic Import API",
+            "revision":    "1"
+        },
+        "tests": tests
     }
-    url = f"{JIRA_BASE_URL}/rest/raven/1.0/api/testrun/{test_run_id}/attachment"
+
+
+def main():
+    if len(sys.argv) != 2:
+        print(f"Usage: {sys.argv[0]} <JIRA_TEST_EXECUTION_KEY>")
+        sys.exit(1)
+
+    test_exec_key = sys.argv[1]
+    payload       = build_payload(test_exec_key)
+
+    if not payload["tests"]:
+        print("❌ No tests to import (check your MAPPING and file paths).")
+        sys.exit(1)
+
+    url = f"{JIRA_BASE_URL}/rest/raven/1.0/import/execution"
     headers = {
         "Authorization": f"Bearer {XRAY_TOKEN}",
-        "Content-Type":  "application/json",
+        "Content-Type":  "application/json"
     }
 
-    max_retries = 5
-    for attempt in range(1, max_retries + 1):
-        resp = requests.post(url, headers=headers, json=payload)
-        if resp.status_code in (200, 201, 204):
-            print(f"✅ Uploaded {filename!r} to run {test_run_id} (HTTP {resp.status_code})")
-            return
+    print(f"🚀 Importing {len(payload['tests'])} tests into execution {test_exec_key}…")
+    resp = requests.post(url, headers=headers, json=payload)
 
-        if resp.status_code == 429:
-            ra = resp.headers.get("Retry-After")
-            wait = sleep_after(attempt, ra)
-            print(f"⚠️ POST rate-limited (attempt {attempt}/{max_retries}), "
-                  f"Retry-After={ra!r}, sleeping {wait:.1f}s…")
-            time.sleep(wait)
-            continue
-
-        # any other error: bail out
+    try:
         resp.raise_for_status()
+    except requests.HTTPError:
+        print(f"❌ Import failed: HTTP {resp.status_code}\n{resp.text}")
+        sys.exit(1)
 
-    raise RuntimeError(f"Upload failed after {max_retries} retries (last code {resp.status_code})")
+    result = resp.json()
+    print(f"✅ Success! Imported execution {test_exec_key}")
+    print(json.dumps(result, indent=2))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <JIRA_TEST_EXEC_KEY>")
-        sys.exit(1)
-
-    test_execution_key = sys.argv[1]
-
-    # ─── Map each XRAY test key to its file + content type ───
-    mapping = {
-        "HPCSVC-2003": {
-            "file":         "filtered_settings/saml_settings_ansible_core.json",
-            "content_type": "application/json",
-        },
-        "HPCSVC-2001": {
-            "file":         "screenshots/screenshot.png",
-            "content_type": "image/png",
-        },
-        # add more entries here …
-    }
-
-    for test_key, details in mapping.items():
-        try:
-            run_id = fetch_test_run_id(test_execution_key, test_key)
-            print(f"🔍 Found run_id: {run_id} for test_key: {test_key}")
-            upload_evidence(run_id, details["file"], details["content_type"])
-        except Exception as e:
-            print(f"❌ ERROR processing test_key '{test_key}': {e}")
+    main()
