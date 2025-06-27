@@ -1,95 +1,69 @@
 #!/usr/bin/env python3
-import sys
 import requests
-import json
 from datetime import datetime
+import sys
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ▶️  CONFIGURATION: Fill these in (or override SRC_TESTCASE via command-line)
+# 🔧  HARDCODED CONFIGURATION — adjust these before you run
 # ──────────────────────────────────────────────────────────────────────────────
 
-JIRA_BASE_URL = "https://your-domain.atlassian.net"      # e.g. https://acme.atlassian.net
-JIRA_API_TOKEN = "YOUR_JIRA_API_TOKEN_HERE"              # paste your API token
-SRC_TESTCASE = "CORE-123"                                # default Test Case key
+JIRA_BASE_URL   = "https://your-domain.atlassian.net"
+JIRA_API_TOKEN  = "YOUR_API_TOKEN_HERE"
+SRC_TESTCASE    = "CORE-123"      # the Test Case you want to clone
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 🚀  You can also override the source Test Case by passing it as the first
-#     argument:
-#        python clone_and_exec.py ORG-456
-# ──────────────────────────────────────────────────────────────────────────────
-
-if len(sys.argv) > 1:
-    SRC_TESTCASE = sys.argv[1]
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 📦  Prepare HTTP headers for Bearer auth
+# 🛠  END OF CONFIGURATION
 # ──────────────────────────────────────────────────────────────────────────────
 
 HEADERS = {
     "Authorization": f"Bearer {JIRA_API_TOKEN}",
-    "Content-Type": "application/json",
-    # Only needed on clone:
+    "Content-Type":  "application/json",
     "X-Atlassian-Token": "no-check",
 }
+XRAY_CLONE = f"{JIRA_BASE_URL}/rest/raven/1.0/api/testcase/{{}}/clone"
+XRAY_EXEC  = f"{JIRA_BASE_URL}/rest/raven/1.0/api/testexec"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 🔄  Clone a Test Case
-# ──────────────────────────────────────────────────────────────────────────────
-
-def clone_testcase(testcase_key: str) -> str:
-    url = f"{JIRA_BASE_URL}/rest/api/2/issue/{testcase_key}/clone"
+def clone_testcase(key):
+    url = XRAY_CLONE.format(key)
     payload = {
-        "fields": {
-            "summary": f"{testcase_key} clone {datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-        }
+      "fields": {
+        "summary": f"{key} clone {datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+      }
     }
-    resp = requests.post(url, headers=HEADERS, json=payload)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["key"]
+    r = requests.post(url, headers=HEADERS, json=payload)
+    r.raise_for_status()
+    return r.json()["key"]
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 📋  Create a Test Execution in Xray for a given Test Case
-# ──────────────────────────────────────────────────────────────────────────────
-
-def create_test_execution(testcase_key: str) -> str:
-    url = f"{JIRA_BASE_URL}/rest/raven/1.0/api/testexec"
-    # Remove the X-Atlassian-Token header for this call
+def create_test_execution(test_key):
     exec_headers = HEADERS.copy()
     exec_headers.pop("X-Atlassian-Token", None)
-
     payload = {
-        "info": {
-            "summary": f"Exec for {testcase_key}",
-            "description": f"Automated execution for {testcase_key}",
-            "issuetype": "Test Execution"
-        },
-        "tests": [{"testKey": testcase_key}]
+      "info": {
+        "summary":     f"Exec for {test_key}",
+        "description": f"Automated exec for {test_key}",
+        "issuetype":   "Test Execution"
+      },
+      "tests": [{"testKey": test_key}]
     }
-    resp = requests.post(url, headers=exec_headers, json=payload)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["testExecIssue"]["key"]
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 🎬  Main flow
-# ──────────────────────────────────────────────────────────────────────────────
+    r = requests.post(XRAY_EXEC, headers=exec_headers, json=payload)
+    r.raise_for_status()
+    return r.json()["testExecIssue"]["key"]
 
 def main():
-    print(f"🔍 Cloning Test Case {SRC_TESTCASE} …")
+    print(f"🔍 Cloning Test Case {SRC_TESTCASE}…")
     new_tc = clone_testcase(SRC_TESTCASE)
-    print(f"✅ New Test Case key: {new_tc}")
+    print(f"✅ New Test Case: {new_tc}")
 
-    print(f"🔍 Creating Test Execution for {new_tc} …")
+    print(f"🔍 Creating Test Execution for {new_tc}…")
     new_exec = create_test_execution(new_tc)
-    print(f"✅ New Test Execution key: {new_exec}")
+    print(f"✅ New Test Execution: {new_exec}")
 
 if __name__ == "__main__":
     try:
         main()
     except requests.HTTPError as e:
-        print(f"❌ HTTP error: {e.response.status_code} {e.response.text}")
+        print("❌ HTTP Error:", e.response.status_code, e.response.text)
         sys.exit(1)
     except Exception as e:
-        print(f"❌ Unexpected error: {e}")
+        print("❌ Error:", e)
         sys.exit(2)
