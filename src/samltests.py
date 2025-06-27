@@ -1,129 +1,74 @@
-#!/usr/bin/env python3
-import os, sys, json, base64, argparse, requests
+---
+- hosts: localhost
+  connection: local
+  gather_facts: no
 
-# ───────────── Configuration ─────────────
-JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
-XRAY_TOKEN    = os.getenv("XRAY_TOKEN")
-if not (JIRA_BASE_URL and XRAY_TOKEN):
-    print("❌ Please export JIRA_BASE_URL and XRAY_TOKEN")
-    sys.exit(1)
+  vars:
+    jira_base: "https://your-domain.atlassian.net"
+    src_testcase: "{{ testcase_to_clone }}"    # e.g. CORE-123
+    jira_token: "{{ lookup('env','JIRA_API_TOKEN') }}"
 
-# ─────────── Mapping ───────────
-# testKey → {
-#   status:      "PASS"/"FAIL"/"TODO",
-#   attachments: { step_index: [ { path, contentType }, … ] }
-# }
-MAPPING = {
-    "HPCSVC-2003": {
-        "status": "PASS",
-        "attachments": {
-            # put your JSON file on step 0 (the first manual step)
-            0: [{
-                "path":        "filtered_settings/saml_settings_ansible_core.json",
-                "contentType": "application/json"
-            }]
-        }
-    },
-    "HPCSVC-2001": {
-        "status": "PASS",
-        "attachments": {
-            # screenshot.png → step 0
-            0: [{
-                "path":        "screenshots/screenshot.png",
-                "contentType": "image/png"
-            }],
-            # aap_screenshot.png → step 1
-            1: [{
-                "path":        "screenshots/aap_screenshot.png",
-                "contentType": "image/png"
-            }]
-        }
-    },
-    # …add more testKeys here…
-}
+  tasks:
+    - name: Fail if no Jira token provided
+      assert:
+        that: jira_token is defined and jira_token | length > 0
+        fail_msg: "Environment variable JIRA_API_TOKEN must be set"
 
-def encode_file_to_b64(path):
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+    - name: Clone Xray Test Case {{ src_testcase }}
+      uri:
+        url: "{{ jira_base }}/rest/api/2/issue/{{ src_testcase }}/clone"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ jira_token }}"
+          X-Atlassian-Token: "no-check"
+          Content-Type: "application/json"
+        body:
+          fields:
+            summary: "{{ src_testcase }} clone {{ lookup('pipe','date +%Y%m%d%H%M%S') }}"
+        body_format: json
+        status_code: 201
+        return_content: yes
+      register: clone
 
-def build_payload(exec_key, selected=None):
-    tests = []
-    for tkey, details in MAPPING.items():
-        if selected and tkey not in selected:
-            continue
+    - name: Extract new Test Case key
+      set_fact:
+        new_testcase_key: "{{ clone.json.key }}"
 
-        step_entries = []
-        for idx, atts in details["attachments"].items():
-            ev = []
-            for att in atts:
-                if not os.path.isfile(att["path"]):
-                    print(f"⚠️  Missing {att['path']} for {tkey} step {idx}, skipping")
-                    continue
-                ev.append({
-                    "data":        encode_file_to_b64(att["path"]),
-                    "filename":    os.path.basename(att["path"]),
-                    "contentType": att["contentType"]
-                })
+    - name: Create Xray Test Execution for the new Test Case
+      uri:
+        url: "{{ jira_base }}/rest/raven/1.0/api/testexec"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ jira_token }}"
+          Content-Type: "application/json"
+        body:
+          info:
+            summary: "Exec for {{ new_testcase_key }}"
+            description: "Automated execution for {{ new_testcase_key }}"
+            issuetype: "Test Execution"
+          tests:
+            - testKey: "{{ new_testcase_key }}"
+        body_format: json
+        status_code: 200,201
+        return_content: yes
+      register: exec
 
-            if not ev:
-                continue
+    - name: Extract new Test Execution key
+      set_fact:
+        new_execution_key: "{{ exec.json.testExecIssue.key }}"
 
-            step_entries.append({
-                "index":       idx,
-                "status":      details["status"],
-                "actualResult":"",
-                "evidence":    ev
-            })
+    - name: Write output keys to JSON
+      copy:
+        dest: run_outputs.json
+        content: |
+          {
+            "testcase": "{{ new_testcase_key }}",
+            "execution": "{{ new_execution_key }}"
+          }
+        mode: '0644'
 
-        if step_entries:
-            tests.append({
-                "testKey": tkey,
-                "status":  details["status"],
-                "steps":   step_entries
-            })
-
-    return {
-        "testExecutionKey": exec_key,
-        "info": {
-            "summary":     f"Import {exec_key}",
-            "description": "Attach step-level files via Generic Import API",
-            "revision":    "1"
-        },
-        "tests": tests
-    }
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("exec_key", help="Test Execution key (e.g. HPCSVC-2869)")
-    p.add_argument("--tests",  nargs="+", help="Only these testKeys (default: all)")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Print JSON payload and exit")
-    args = p.parse_args()
-
-    payload = build_payload(args.exec_key, args.tests)
-    if not payload["tests"]:
-        print("❌ Nothing to import. Check MAPPING and file paths.")
-        sys.exit(1)
-
-    if args.dry_run:
-        print(json.dumps(payload, indent=2))
-        sys.exit(0)
-
-    url = f"{JIRA_BASE_URL}/rest/raven/1.0/import/execution"
-    headers = {
-        "Authorization": f"Bearer {XRAY_TOKEN}",
-        "Content-Type":  "application/json"
-    }
-
-    print(f"🚀 Importing {len(payload['tests'])} tests into {args.exec_key}")
-    resp = requests.post(url, headers=headers, json=payload)
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError:
-        print(f"❌ Import failed: HTTP {resp.status_code}\n{resp.text}")
-        sys.exit(1)
-
-    print("✅ Success!", json.dumps(resp.json(), indent=2))
-
-if __name__ == "__main__":
-    main()
+    - name: Display results
+      debug:
+        msg:
+          - "🆕 Cloned Test Case: {{ new_testcase_key }}"
+          - "🚀 Created Test Execution: {{ new_execution_key }}"
