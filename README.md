@@ -121,3 +121,57 @@ To ensure the code adheres to best practices and style guidelines, we use ESLint
 
 	•	SQL Injection Protection: Parameterized queries are used to protect against SQL injection.
 	•	Environment Variables: Sensitive information is stored in environment variables.
+
+
+import requests
+import zipfile
+import io
+import os
+from datetime import datetime
+
+# --- Setup ---
+GITLAB_PROJECT_ID = "<scanner_project_id>"     # numeric project id
+GITLAB_JOB_ID     = "<job_id_of_finished_job>" # job that produced artifacts.zip
+GITLAB_TOKEN      = os.getenv("GITLAB_TOKEN")  # personal/group access token
+
+DD_URL      = os.getenv("DD_URL", "https://defectdojo.example.com")
+DD_TOKEN    = os.getenv("DD_TOKEN")
+DD_TEST_ID  = os.getenv("DD_TEST_ID")          # existing test id, if you want reimport
+DD_ENG_ID   = os.getenv("DD_ENGAGEMENT_ID")    # only used for first import
+SCAN_TYPE   = "Generic Findings Import"        # or GitLab SAST/Dependency/DAST/etc.
+
+# --- 1. Download artifacts.zip from GitLab ---
+print("Downloading artifacts...")
+artifacts_url = f"https://gitlab.example.com/api/v4/projects/{GITLAB_PROJECT_ID}/jobs/{GITLAB_JOB_ID}/artifacts"
+resp = requests.get(artifacts_url, headers={"PRIVATE-TOKEN": GITLAB_TOKEN})
+resp.raise_for_status()
+
+# --- 2. Extract parsed_vulnera.json ---
+z = zipfile.ZipFile(io.BytesIO(resp.content))
+with z.open("parsed_vulnera.json") as f:
+    open("parsed_vulnera.json", "wb").write(f.read())
+
+# --- 3. Upload to DefectDojo ---
+files = {"file": open("parsed_vulnera.json", "rb")}
+data = {
+    "scan_type": SCAN_TYPE,
+    "scan_date": datetime.utcnow().isoformat(),
+    "close_old_findings": "true",
+    "active": "true",
+    "verified": "false",
+}
+
+headers = {"Authorization": f"Token {DD_TOKEN}"}
+
+if DD_TEST_ID:
+    print(f"Reimporting into test {DD_TEST_ID}")
+    data["test"] = DD_TEST_ID
+    url = f"{DD_URL}/api/v2/reimport-scan/"
+else:
+    print("Importing into engagement", DD_ENG_ID)
+    data["engagement"] = DD_ENG_ID
+    url = f"{DD_URL}/api/v2/import-scan/"
+
+r = requests.post(url, headers=headers, files=files, data=data)
+print("Status:", r.status_code)
+print("Response:", r.text)
