@@ -1,0 +1,32 @@
+
+
+// Storage Account Access Summary with SAS indicator
+StorageBlobLogs
+| where TimeGenerated > ago(30d)
+| extend AccountName = tostring(split(ResourceId, "/")[8])
+| extend IP = tostring(split(CallerIpAddress, ":")[0])
+| extend SASUsed = iff(AuthenticationType has "SAS", "Yes", "No")
+| summarize Count = count() by AccountName, StatusCode, StatusText, IP, SASUsed
+| order by Count desc
+
+To show only public IPs (not your internal VNets):
+| where not(IP startswith "10.") 
+  and not(IP startswith "172.") 
+  and not(IP startswith "192.168.")
+
+To find the top accounts using SAS most heavily:
+| where SASUsed == "Yes"
+| summarize TotalSASRequests = count() by AccountName
+| order by TotalSASRequests desc
+
+Some environments log to AzureDiagnostics instead of StorageBlobLogs.
+In that case, swap the table name and fields like so:
+
+AzureDiagnostics
+| where ResourceProvider == "MICROSOFT.STORAGE"
+| where OperationName == "GetBlob" or OperationName == "PutBlob"
+| extend AccountName = tostring(split(ResourceId, "/")[8])
+| extend IP = tostring(split(CallerIpAddress, ":")[0])
+| extend SASUsed = iff(AuthenticationType_s has "SAS", "Yes", "No")
+| summarize Count=count() by AccountName, StatusCode_s, StatusText_s, IP, SASUsed
+| order by Count desc
