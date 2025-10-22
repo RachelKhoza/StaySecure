@@ -1,0 +1,14 @@
+# List all storage accounts with their public access settings
+az graph query -q "
+Resources
+| where type == 'microsoft.storage/storageaccounts'
+| project name, resourceGroup, subscriptionId, publicNetworkAccess = properties.publicNetworkAccess, networkRuleSet = properties.networkAcls.defaultAction
+"
+
+
+#To dig deeper into container-level public access:
+
+for acc in $(az storage account list --query "[].name" -o tsv); do
+  echo "Checking $acc..."
+  az storage container list --account-name $acc --query "[?properties.publicAccess!='None'].{Container:name, PublicAccess:properties.publicAccess}" -o table
+done
