@@ -1,0 +1,69 @@
+# ===========================
+# WSUS Role Detection (Azure Cloud Shell)
+# ===========================
+
+# Create timestamped output file
+$OutputFile = "/home/$env:USER/WSUS_Status_Report_{0}.csv" -f (Get-Date -Format 'yyyyMMdd_HHmmss')
+$Results = @()
+
+# Fetch all Windows VMs
+$VMs = Get-AzVM | Where-Object { $_.StorageProfile.OsDisk.OsType -eq 'Windows' }
+
+Write-Host "`nFound $($VMs.Count) Windows VMs. Checking WSUS role..." -ForegroundColor Cyan
+
+foreach ($vm in $VMs) {
+    try {
+        Write-Host "Checking WSUS role on: $($vm.Name) ..." -ForegroundColor White
+
+        # PowerShell command to check WSUS feature
+        $script = 'Try { $feature = Get-WindowsFeature -Name UpdateServices; if ($feature -ne $null) { $feature.Installed } else { "NotFound" } } Catch { "Error" }'
+
+        $result = Invoke-AzVMRunCommand -ResourceGroupName $vm.ResourceGroupName -VMName $vm.Name `
+                    -CommandId 'RunPowerShellScript' -ScriptString $script -ErrorAction Stop
+
+        $output = $result.Value[0].Message.Trim()
+
+        # Normalize output
+        if ($output -match "True") {
+            $wsus_status = "Installed"
+        }
+        elseif ($output -match "False") {
+            $wsus_status = "Not Installed"
+        }
+        elseif ($output -match "NotFound") {
+            $wsus_status = "Feature Not Found"
+        }
+        else {
+            $wsus_status = "Error/Unknown"
+        }
+
+        # Add result
+        $Results += [PSCustomObject]@{
+            VMName        = $vm.Name
+            ResourceGroup = $vm.ResourceGroupName
+            Location      = $vm.Location
+            WSUS_Status   = $wsus_status
+        }
+
+        Write-Host "✔ $($vm.Name): WSUS $wsus_status" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Failed to query $($vm.Name): $_"
+        $Results += [PSCustomObject]@{
+            VMName        = $vm.Name
+            ResourceGroup = $vm.ResourceGroupName
+            Location      = $vm.Location
+            WSUS_Status   = "Error/No Access"
+        }
+    }
+}
+
+# Export results to CSV
+if ($Results.Count -gt 0) {
+    $Results | Export-Csv -Path $OutputFile -NoTypeInformation
+    Write-Host "`nReport saved to: $OutputFile" -ForegroundColor Yellow
+    Write-Host "`nTo download locally, run:" -ForegroundColor Cyan
+    Write-Host "download $OutputFile" -ForegroundColor Green
+} else {
+    Write-Warning "No data to export."
+}
