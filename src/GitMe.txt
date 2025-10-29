@@ -68,13 +68,3 @@ if ($Results.Count -gt 0) {
     Write-Warning "No data to export."
 }
 
-
-Hi Team,
-
-We’ve detected brute-force login attempts on the MySQL server hosting our Grafana database (mgmt-weu-p-*). The server currently allows public access, which increases our attack surface.
-
-I recommend disabling public network access and restricting connectivity to Azure-internal resources. This will prevent external IPs from reaching the database while keeping Grafana fully functional.
-
-If Grafana runs within the same Azure VNet or region, we don’t need a Private Endpoint immediately — we can simply rely on internal network access. A Private Endpoint is only required if Grafana or related services are in a different network or subscription and need secure cross-network access.
-
-If needed, public access can easily be re-enabled (rollback) through Azure Portal 
