@@ -1,0 +1,3 @@
+	Let’s close the investigation since all login attempts failed and we lack audit detail for deeper correlation.
+	•	Proceed with disabling public access and implementing the NAT Gateway configuration (Option 2) to harden exposure.
+	•	We’ll also enable audit and diagnostic logging on the MySQL instance going forward to capture future connection attempts.
