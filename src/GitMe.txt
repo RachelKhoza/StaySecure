@@ -68,3 +68,11 @@ if ($Results.Count -gt 0) {
     Write-Warning "No data to export."
 }
 
+No lift-and-shift risk – Grafana stays on the same VM/subnet; we just attach a NAT Gateway. No re-IP, no redeploy, minimal downtime risk.
+	•	Faster implementation – Only minor Terraform change (add NATGW + subnet association) instead of moving workloads or rebuilding infrastructure.
+	•	Lower blast radius – We touch only the subnet configuration, not VM, NSG, or route table objects.
+	•	Immediate security gain – Once NATGW is in place, we can disable public access on MySQL and stop brute-force attempts.
+	•	Rollback friendly – Easy to revert by detaching the NATGW or temporarily re-enabling public access if connectivity issues arise.
+	•	Future-proof path – Keeps us aligned for an eventual Private Endpoint rollout (Option 3) without major redesign.
+
+⸻
