@@ -1,55 +1,12 @@
-⚠️ URGENT: NPM Supply-Chain Attack — GitLab Developer Advisory
+There is no requirement in any cloud to have every component in an availability set.
+Core Skype components in the cloud solution are placed in availability sets for high availability.
+Boxes not in availability sets are designed that way because:
 
-A major npm supply-chain attack (“Shai-hulud”) is currently active and spreading. Several npm packages have been modified with malicious postinstall scripts that exfiltrate secrets and can damage systems.
+They serve a single function.
+They are not intended to be highly available.
 
-🚫 Immediate Action: Do NOT run npm install or npm update
 
-Compromised packages are still being published.
-
-⸻
-
-🔍 What the malware does
-
-The infected packages run scripts that:
-	•	Steal CI/CD variables and cloud credentials (AWS/GCP/Azure)
-	•	Scan developer machines for secrets
-	•	Exfiltrate data to malicious webhook domains
-	•	In some cases, wipe the user’s home directory (destructive payload)
-
-This affects any environment running npm — laptops, GitLab runners, containers, VMs.
-
-⸻
-
-🛡️ Required Actions (GitLab-focused)
-	•	Stop all npm installs/updates immediately
-	•	Block outbound traffic to:
-webhook[.]site and *.site
-	•	Check your project dependencies against compromised lists:
-	•	https://alkido.dev
-	•	https://socket.dev
-	•	Review GitLab pipelines for any npm install steps
-(disable them until further notice)
-	•	Rotate CI/CD variables, tokens, and cloud keys if your project is at risk
-	•	Audit projects for unusual pipeline changes or unexpected files/scripts
-	•	Clean up unnecessary access tokens and API keys
-
-⸻
-
-❓ Are we safe on GitLab?
-
-✔️ GitLab platform itself is safe
-
-There is no vulnerability in GitLab related to this attack.
-
-❗ However, GitLab runners and repos can still be compromised if:
-	•	A malicious npm package runs in your pipeline
-	•	A developer installs a compromised package locally and pushes infected code
-	•	Secrets stored in GitLab’s CI variables are accessed by those scripts
-
-So GitLab is not the target, but npm can still leak your secrets from GitLab pipelines.
-
-⸻
-
-⏳ When will npm be safe?
-
-Unknown. We’ll share updates as the ecosystem stabilizes.
+Examples: Windows Admin Centre, PowerShell boxes – quick to rebuild, so HA is unnecessary.
+Adding them to availability sets would increase cost without benefit.
+The assumption that “all production services have availability sets” comes from an application-level perspective, not from auxiliary services.
+Exceptions may exist, but 99.9% follow this design principle.
