@@ -1,0 +1,10 @@
+hanks for the question — and I completely understand the concern.
+My initial thinking was based on foresight rather than dependency on dev leads. Abhishek actually highlighted one project after my message, but once he ran the SBOM he saw that those packages weren’t present at all. That confirmed my impression that dev leads know their environments and build chains better than anyone else, so they are able to validate quickly whether a repo is affected or not.
+
+That said, I acknowledge that relying on them for feedback can introduce delays or inconsistencies, and I apologize if my approach created that impression.
+
+I’ll manage this better by tightening our side of the evaluation:
+* I’ll use our tooling (SBOM + CI policy scans) to produce an initial impact assessment ourselves.
+* Dev leads will only validate edge cases, not drive the core evaluation.
+
+This reduces risk and keeps ownership with the security function while still leveraging their repo-specific knowledge when needed.”*
