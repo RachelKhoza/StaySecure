@@ -1,10 +1,74 @@
-hanks for the question — and I completely understand the concern.
-My initial thinking was based on foresight rather than dependency on dev leads. Abhishek actually highlighted one project after my message, but once he ran the SBOM he saw that those packages weren’t present at all. That confirmed my impression that dev leads know their environments and build chains better than anyone else, so they are able to validate quickly whether a repo is affected or not.
+stages:
+  - precheck
+  - scan
+  - ioc
+  - report
 
-That said, I acknowledge that relying on them for feedback can introduce delays or inconsistencies, and I apologize if my approach created that impression.
+# Global variables for containment
+variables:
+  NPM_CONFIG_IGNORE_SCRIPTS: "true"    # disable preinstall/postinstall execution
+  ASTENABLEMRPIPELINES: "true"         # show findings in MRs
+  SECRETDETECTIONHISTORICSCAN: "true"  # full history scan
 
-I’ll manage this better by tightening our side of the evaluation:
-* I’ll use our tooling (SBOM + CI policy scans) to produce an initial impact assessment ourselves.
-* Dev leads will only validate edge cases, not drive the core evaluation.
+# -------- 1. PRECHECK: Detect package.json without executing scripts -------
+precheck:
+  stage: precheck
+  image: node:20-alpine
+  script:
+    - if [ ! -f package.json ]; then echo "No Node project"; exit 0; fi
+  rules:
+    - exists:
+        - package.json
 
-This reduces risk and keeps ownership with the security function while still leveraging their repo-specific knowledge when needed.”*
+# -------- 2. SCAN: SBOM + Dependency Scan + Secrets Detection --------------
+sbom_scan:
+  stage: scan
+  extends: .cyclonedx-sbom
+  rules:
+    - exists:
+        - package-lock.json
+
+dependency_scan:
+  stage: scan
+  extends: .dependency_scanning
+  rules:
+    - exists:
+        - package-lock.json
+
+secret_scan:
+  stage: scan
+  extends: .secret_detection
+  rules:
+    - when: always
+
+# -------- 3. IoC Hunt for Shai-Hulud Malware -------------------------------
+ioc_shaihulud:
+  stage: ioc
+  image: alpine:3.19
+  before_script:
+    - apk add --no-cache ripgrep git
+  script:
+    # Files malware drops
+    - rg -n --glob 'node_modules/' 'setupbun.js|bun_environment.js' || true
+
+    # Preinstall hooks (review carefully)
+    - rg -n --glob 'node_modules/' '"preinstall"' || true
+
+    # Rogue GitHub Actions files
+    - rg -n --glob 'node_modules/' 'shai-hulud*' || true
+
+    # References to TruffleHog secret harvesting
+    - rg -n --glob 'node_modules/' 'trufflehog' || true
+
+  artifacts:
+    when: always
+    paths: ["iocshaihulud.log"]
+  allow_failure: false
+
+# -------- 4. REPORT STAGE ---------------------------------------------------
+report:
+  stage: report
+  script:
+    - echo "IoC and SBOM Scan Completed"
+  rules:
+    - when: always
