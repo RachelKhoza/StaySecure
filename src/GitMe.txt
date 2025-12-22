@@ -1,74 +1,62 @@
 stages:
   - precheck
   - scan
+  - test
   - ioc
   - report
 
-# Global variables for containment
 variables:
-  NPM_CONFIG_IGNORE_SCRIPTS: "true"    # disable preinstall/postinstall execution
-  ASTENABLEMRPIPELINES: "true"         # show findings in MRs
-  SECRETDETECTIONHISTORICSCAN: "true"  # full history scan
+  DEPENDENCY_SCANNING_STAGE: scan
+  NPM_CONFIG_IGNORE_SCRIPTS: "true"
+  ASTENABLEMRPIPELINES: "true"
+  SECRETDETECTIONHISTORICSCAN: "true"
 
-# -------- 1. PRECHECK: Detect package.json without executing scripts -------
+include:
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
 precheck:
   stage: precheck
-  image: node:20-alpine
+  image: alpine:3.19
   script:
-    - if [ ! -f package.json ]; then echo "No Node project"; exit 0; fi
+    - |
+      if [ ! -f package.json ]; then
+        echo "No Node project detected"
+        exit 0
+      fi
+      echo "Node project detected"
   rules:
     - exists:
         - package.json
 
-# -------- 2. SCAN: SBOM + Dependency Scan + Secrets Detection --------------
-sbom_scan:
-  stage: scan
-  extends: .cyclonedx-sbom
-  rules:
-    - exists:
-        - package-lock.json
-
-dependency_scan:
-  stage: scan
-  extends: .dependency_scanning
-  rules:
-    - exists:
-        - package-lock.json
-
-secret_scan:
-  stage: scan
-  extends: .secret_detection
-  rules:
-    - when: always
-
-# -------- 3. IoC Hunt for Shai-Hulud Malware -------------------------------
 ioc_shaihulud:
   stage: ioc
   image: alpine:3.19
   before_script:
-    - apk add --no-cache ripgrep git
+    - apk add --no-cache ripgrep
   script:
-    # Files malware drops
-    - rg -n --glob 'node_modules/' 'setupbun.js|bun_environment.js' || true
-
-    # Preinstall hooks (review carefully)
-    - rg -n --glob 'node_modules/' '"preinstall"' || true
-
-    # Rogue GitHub Actions files
-    - rg -n --glob 'node_modules/' 'shai-hulud*' || true
-
-    # References to TruffleHog secret harvesting
-    - rg -n --glob 'node_modules/' 'trufflehog' || true
-
+    - mkdir -p ioc
+    - echo "🔍 Scanning for Shai-Hulud IoCs"
+    - rg -n 'setupbun\.js|bun_environment\.js|shai-hulud|trufflehog|preinstall|postinstall' . > ioc/shaihulud.txt || true
+    - |
+      if [ -s ioc/shaihulud.txt ]; then
+        echo "🚨 IoC MATCHES FOUND"
+        cat ioc/shaihulud.txt
+        exit 1
+      else
+        echo "✅ No IoCs found"
+      fi
   artifacts:
     when: always
-    paths: ["iocshaihulud.log"]
-  allow_failure: false
+    paths:
+      - ioc/shaihulud.txt
+  rules:
+    - exists:
+        - package.json
 
-# -------- 4. REPORT STAGE ---------------------------------------------------
 report:
   stage: report
   script:
-    - echo "IoC and SBOM Scan Completed"
+    - echo "Scan completed"
   rules:
     - when: always
