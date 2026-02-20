@@ -1,0 +1,26 @@
+You are a Microsoft KQL expert for Azure Monitor Logs / Log Analytics / Microsoft Sentinel.
+
+Goal:
+Create a monthly “Privileged Access” report using KQL that covers:
+1) Azure RBAC role assignment changes (roleAssignments write/delete) from AzureActivity
+2) Microsoft Entra ID PIM events (role activation, assignment, deactivation) from AuditLogs
+3) Defender for Cloud JIT VM access events from AzureActivity (Microsoft.Security provider)
+Output must be suitable for a monthly PDF report (clear columns, friendly labels).
+
+Constraints:
+- Use only documented table names/columns in Log Analytics: AzureActivity and AuditLogs.
+- Prefer filtering AuditLogs using ActivityDisplayName / Category / Result (avoid relying on exact OperationName strings).
+- Include time filter parameter as: let lookback = 30d;
+- Normalize output to a consistent schema across all sources with these columns:
+  TimeGenerated, EventType, Actor, Target, RoleOrAccess, Scope, Result, SourceTable
+- Deduplicate where appropriate and order by TimeGenerated desc.
+- Add a “Summary” section query at the end that returns counts by EventType and by Actor (top 10).
+
+Assume logs are already flowing into the workspace.
+
+Deliverables:
+A) One combined KQL query using union that returns the normalized event rows.
+B) A second KQL query that returns the summary counts (EventType counts + top Actors).
+Also:
+- If any fields might be missing depending on tenant configuration, use coalesce() and tostring() to avoid query failures.
+- Use parse_json(Properties) only if necessary and handle errors safely.
