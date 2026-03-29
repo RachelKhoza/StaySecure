@@ -8,188 +8,22 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-Write-Host "Checking VM power state..."
-$vmStatus = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VmName -Status
-$powerState = ($vmStatus.Statuses | Where-Object { $_.Code -like "PowerState/*" }).DisplayStatus
-
-if ($powerState -ne "VM running") {
-    Write-Host ""
-    Write-Host "===== RESULT ====="
-    [pscustomobject]@{
-        VmName             = $VmName
-        ResourceGroupName  = $ResourceGroupName
-        PowerState         = $powerState
-        RunCommandReady    = $false
-        RemotelyPatchable  = $false
-        Reason             = "VM is not running"
-    } | Format-List
-    return
-}
-
-Write-Host "Testing Azure Run Command..."
-try {
-    $probe = Invoke-AzVMRunCommand `
-        -ResourceGroupName $ResourceGroupName `
-        -VMName $VmName `
-        -CommandId "RunPowerShellScript" `
-        -ScriptString 'Write-Output "RUN_COMMAND_OK"'
-
-    $probeText = ($probe.Value | ForEach-Object { $_.Message }) -join "`n"
-
-    if ($probeText -notmatch "RUN_COMMAND_OK") {
-        throw "Run Command probe did not return expected text."
-    }
-}
-catch {
-    Write-Host ""
-    Write-Host "===== RESULT ====="
-    [pscustomobject]@{
-        VmName             = $VmName
-        ResourceGroupName  = $ResourceGroupName
-        PowerState         = $powerState
-        RunCommandReady    = $false
-        RemotelyPatchable  = $false
-        Reason             = $_.Exception.Message
-    } | Format-List
-    return
-}
-
-Write-Host "Running remote update assessment..."
-
-$remoteScript = @'
-$ErrorActionPreference = "Stop"
-
-function Test-PendingReboot {
-    $paths = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
-    )
-
-    foreach ($path in $paths) {
-        if (Test-Path $path) { return $true }
-    }
-
-    try {
-        $pendingRename = Get-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" `
-            -Name "PendingFileRenameOperations" `
-            -ErrorAction SilentlyContinue
-        if ($null -ne $pendingRename.PendingFileRenameOperations) {
-            return $true
-        }
-    } catch {}
-
-    return $false
-}
-
-function Get-UpdateSummary {
-    $session = New-Object -ComObject Microsoft.Update.Session
-    $searcher = $session.CreateUpdateSearcher()
-    $result = $searcher.Search("IsInstalled=0 and Type='Software'")
-
-    $security = @()
-    $critical = @()
-
-    foreach ($update in $result.Updates) {
-        $categoryNames = @()
-        foreach ($cat in $update.Categories) {
-            $categoryNames += $cat.Name
-        }
-
-        if ($categoryNames -contains "Security Updates") {
-            $security += [pscustomobject]@{
-                Title      = $update.Title
-                KBs        = @($update.KBArticleIDs) -join ","
-                Categories = $categoryNames -join ", "
-            }
-        }
-
-        if ($categoryNames -contains "Critical Updates") {
-            $critical += [pscustomobject]@{
-                Title      = $update.Title
-                KBs        = @($update.KBArticleIDs) -join ","
-                Categories = $categoryNames -join ", "
-            }
-        }
-    }
-
-    [pscustomobject]@{
-        SecurityCount = $security.Count
-        CriticalCount = $critical.Count
-        SecurityTop5  = $security | Select-Object -First 5
-        CriticalTop5  = $critical | Select-Object -First 5
-    }
-}
-
-$wuauserv = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
-$bits     = Get-Service -Name bits -ErrorAction SilentlyContinue
-
-$updates = Get-UpdateSummary
-$recentHotfixes = Get-HotFix |
-    Sort-Object InstalledOn -Descending |
-    Select-Object -First 10 HotFixID, Description, InstalledOn
-
-$result = [pscustomobject]@{
-    ComputerName         = $env:COMPUTERNAME
-    PsVersion            = $PSVersionTable.PSVersion.ToString()
-    OsCaption            = (Get-CimInstance Win32_OperatingSystem).Caption
-    LastBootUpTime       = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-    WindowsUpdateSvc     = if ($wuauserv) { $wuauserv.Status.ToString() } else { "NotFound" }
-    BitsSvc              = if ($bits) { $bits.Status.ToString() } else { "NotFound" }
-    PendingReboot        = Test-PendingReboot
-    SecurityUpdateCount  = $updates.SecurityCount
-    CriticalUpdateCount  = $updates.CriticalCount
-    SecurityUpdatesTop5  = $updates.SecurityTop5
-    CriticalUpdatesTop5  = $updates.CriticalTop5
-    RecentHotfixesTop10  = $recentHotfixes
-}
-
-$result | ConvertTo-Json -Depth 6
+$script = @'
+Get-Service |
+    Where-Object {
+        $_.Name -like "vstsagent*" -or
+        $_.DisplayName -like "*Azure Pipelines*" -or
+        $_.DisplayName -like "*Agent*"
+    } |
+    Select-Object Name, DisplayName, Status, StartType |
+    Sort-Object Name |
+    Format-Table -AutoSize
 '@
 
-$assessment = Invoke-AzVMRunCommand `
+$result = Invoke-AzVMRunCommand `
     -ResourceGroupName $ResourceGroupName `
     -VMName $VmName `
-    -CommandId "RunPowerShellScript" `
-    -ScriptString $remoteScript
+    -CommandId 'RunPowerShellScript' `
+    -ScriptString $script
 
-$assessmentText = ($assessment.Value | ForEach-Object { $_.Message }) -join "`n"
-
-$jsonStart = $assessmentText.IndexOf("{")
-if ($jsonStart -lt 0) {
-    throw "Could not parse remote assessment output."
-}
-
-$jsonText = $assessmentText.Substring($jsonStart)
-$resultObj = $jsonText | ConvertFrom-Json
-
-Write-Host ""
-Write-Host "===== SUMMARY ====="
-[pscustomobject]@{
-    VmName                = $VmName
-    ResourceGroupName     = $ResourceGroupName
-    PowerState            = $powerState
-    RunCommandReady       = $true
-    RemotelyPatchable     = $true
-    ComputerName          = $resultObj.ComputerName
-    OsCaption             = $resultObj.OsCaption
-    PsVersion             = $resultObj.PsVersion
-    WindowsUpdateSvc      = $resultObj.WindowsUpdateSvc
-    BitsSvc               = $resultObj.BitsSvc
-    PendingReboot         = $resultObj.PendingReboot
-    SecurityUpdateCount   = $resultObj.SecurityUpdateCount
-    CriticalUpdateCount   = $resultObj.CriticalUpdateCount
-    LastBootUpTime        = $resultObj.LastBootUpTime
-} | Format-List
-
-Write-Host ""
-Write-Host "===== TOP SECURITY UPDATES ====="
-$resultObj.SecurityUpdatesTop5 | Format-Table -AutoSize
-
-Write-Host ""
-Write-Host "===== TOP CRITICAL UPDATES ====="
-$resultObj.CriticalUpdatesTop5 | Format-Table -AutoSize
-
-Write-Host ""
-Write-Host "===== RECENT HOTFIXES ====="
-$resultObj.RecentHotfixesTop10 | Format-Table -AutoSize
+($result.Value | ForEach-Object { $_.Message }) -join "`n"
