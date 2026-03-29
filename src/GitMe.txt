@@ -1,1 +1,14 @@
+$org = "Any"
+$pat = $env:ADO_PAT
 
+$base64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat"))
+
+$headers = @{
+    Authorization = "Basic $base64"
+}
+
+$result = Invoke-RestMethod `
+  -Uri "https://dev.azure.com/$org/_apis/distributedtask/pools?api-version=7.1" `
+  -Headers $headers
+
+$result.value | Format-Table id, name
