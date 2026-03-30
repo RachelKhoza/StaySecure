@@ -1,554 +1,253 @@
-param(
-    [Parameter(Mandatory = $true)]
-    [string]$ResourceGroupName,
-
-    [Parameter(Mandatory = $true)]
-    [string]$VmName,
-
-    [string]$AdoOrganization = "Any",
-    [int]$IdleTimeoutMinutes = 60,
-    [int]$IdlePollSeconds = 60,
-    [int]$DrainWaitSeconds = 25,
-    [int]$VmBootTimeoutMinutes = 30,
-    [int]$VmPollSeconds = 30,
-
-    [switch]$CheckOnly
-)
-
-$ErrorActionPreference = "Stop"
-
-# =========================
-# Config: VM -> Pool + Agents
-# =========================
-$VmConfigMap = @{
-    "GLBL-SEA-P-AZDE" = @{
-        PoolId = 14
-        Agents = @(
-            "GLBLSEAP01",
-            "GLBLSEAP02",
-            "GLBLSEAP03",
-            "GLBLSEAP04"
-        )
-    }
-}
-
-# =========================
-# Helpers
-# =========================
-function Write-Log {
-    param([string]$Message)
-    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
-}
-
-function New-AdoAuthHeader {
-    param([string]$Pat)
-
-    $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Pat"))
-    @{
-        Authorization = "Basic $base64AuthInfo"
-        "Content-Type" = "application/json"
-    }
-}
-
-function Get-VmPatchConfig {
-    param(
-        [string]$VmName,
-        [hashtable]$VmConfigMap
-    )
-
-    if (-not $VmConfigMap.ContainsKey($VmName)) {
-        throw "No patch config found for VM '$VmName'"
-    }
-
-    $VmConfigMap[$VmName]
-}
-
-function Get-AdoAgentsInPool {
-    param(
-        [string]$Organization,
-        [int]$PoolId,
-        [hashtable]$Headers
-    )
-
-    $uri = "https://dev.azure.com/$Organization/_apis/distributedtask/pools/$PoolId/agents?includeAssignedRequest=true&includeCapabilities=true&api-version=7.1"
-    (Invoke-RestMethod -Uri $uri -Headers $Headers -Method Get).value
-}
-
-function Get-AdoAgentsForVm {
-    param(
-        [array]$Agents,
-        [string[]]$ExpectedAgentNames
-    )
-
-    $matchedAgents = $Agents | Where-Object { $ExpectedAgentNames -contains $_.name }
-
-    if (-not $matchedAgents -or $matchedAgents.Count -eq 0) {
-        throw "No mapped ADO agents found in pool."
-    }
-
-    $matchedAgents
-}
-
-function Test-AdoAgentBusy {
-    param($Agent)
-
-    if ($null -ne $Agent.assignedRequest) { return $true }
-    return $false
-}
-
-function Test-AllVmAgentsIdle {
-    param([array]$VmAgents)
-
-    foreach ($agent in $VmAgents) {
-        if ($agent.status -ne "online") {
-            Write-Log "Agent $($agent.name) is not online. Status: $($agent.status)"
-            return $false
-        }
-
-        if (Test-AdoAgentBusy -Agent $agent) {
-            Write-Log "Agent $($agent.name) is busy."
-            return $false
-        }
-    }
-
-    return $true
-}
-
-function Set-AdoAgentEnabledState {
-    param(
-        [string]$Organization,
-        [int]$PoolId,
-        [int]$AgentId,
-        [string]$AgentName,
-        [bool]$Enabled,
-        [hashtable]$Headers
-    )
-
-    $uri = "https://dev.azure.com/$Organization/_apis/distributedtask/pools/$PoolId/agents/$AgentId?api-version=7.1"
-
-    $body = @{
-        id      = $AgentId
-        enabled = $Enabled
-        name    = $AgentName
-    } | ConvertTo-Json
-
-    Invoke-RestMethod -Uri $uri -Headers $Headers -Method Patch -Body $body | Out-Null
-}
-
-function Set-AllAgentsEnabledState {
-    param(
-        [array]$VmAgents,
-        [string]$Organization,
-        [int]$PoolId,
-        [bool]$Enabled,
-        [hashtable]$Headers
-    )
-
-    foreach ($agent in $VmAgents) {
-        Write-Log "Setting agent $($agent.name) enabled=$Enabled"
-        Set-AdoAgentEnabledState `
-            -Organization $Organization `
-            -PoolId $PoolId `
-            -AgentId $agent.id `
-            -AgentName $agent.name `
-            -Enabled $Enabled `
-            -Headers $Headers
-    }
-}
-
-function Wait-ForVmGuestReady {
-    param(
-        [string]$ResourceGroupName,
-        [string]$VmName,
-        [int]$TimeoutMinutes = 30,
-        [int]$PollSeconds = 30
-    )
-
-    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
-
-    while ((Get-Date) -lt $deadline) {
-        try {
-            $current = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VmName -Status
-            $powerState = ($current.Statuses | Where-Object Code -like 'PowerState/*').DisplayStatus
-
-            if ($powerState -eq "VM running") {
-                $probe = Invoke-AzVMRunCommand `
-                    -ResourceGroupName $ResourceGroupName `
-                    -VMName $VmName `
-                    -CommandId "RunPowerShellScript" `
-                    -ScriptString 'Write-Output "VM_GUEST_READY"'
-
-                $msg = ($probe.Value | ForEach-Object { $_.Message }) -join "`n"
-                if ($msg -match "VM_GUEST_READY") {
-                    return $true
-                }
-            }
-        }
-        catch {
-        }
-
-        Start-Sleep -Seconds $PollSeconds
-    }
-
-    return $false
-}
-
-# =========================
-# PAT / Config
-# =========================
-$AdoPat = $env:ADO_PAT
-if (-not $AdoPat) {
-    throw "Environment variable ADO_PAT is not set."
-}
-
-$vmConfig = Get-VmPatchConfig -VmName $VmName -VmConfigMap $VmConfigMap
-$PoolId = $vmConfig.PoolId
-$ExpectedAgents = $vmConfig.Agents
-$Headers = New-AdoAuthHeader -Pat $AdoPat
-
-Write-Log "Resolved VM config: VM=$VmName PoolId=$PoolId Agents=$($ExpectedAgents -join ', ')"
-
-# =========================
-# VM Power Check
-# =========================
-$vmStatus = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VmName -Status
-$powerState = ($vmStatus.Statuses | Where-Object Code -like "PowerState/*").DisplayStatus
-
-if ($powerState -ne "VM running") {
-    throw "VM $VmName is not running. Current state: $powerState"
-}
-
-Write-Log "VM is running."
-
-# =========================
-# Wait for Idle
-# =========================
-Write-Log "Checking ADO agents for idle state..."
-$idleDeadline = (Get-Date).AddMinutes($IdleTimeoutMinutes)
-$idleConfirmed = $false
-$vmAgents = $null
-
-while ((Get-Date) -lt $idleDeadline) {
-    $allAgents = Get-AdoAgentsInPool -Organization $AdoOrganization -PoolId $PoolId -Headers $Headers
-    $vmAgents = Get-AdoAgentsForVm -Agents $allAgents -ExpectedAgentNames $ExpectedAgents
-
-    $agentSummary = $vmAgents | Select-Object name, status, enabled, @{Name="Busy";Expression={ $null -ne $_.assignedRequest }}
-    $agentSummary | Format-Table -AutoSize | Out-String | Write-Host
-
-    if (Test-AllVmAgentsIdle -VmAgents $vmAgents) {
-        $idleConfirmed = $true
-        break
-    }
-
-    Write-Log "Agents not idle yet. Waiting $IdlePollSeconds seconds..."
-    Start-Sleep -Seconds $IdlePollSeconds
-}
-
-if (-not $idleConfirmed) {
-    throw "Timed out waiting for all agents on VM $VmName to become idle."
-}
-
-Write-Log "All mapped agents are idle."
-
-if ($CheckOnly) {
-    Write-Log "CheckOnly specified. Exiting before drain and patch."
-    return
-}
-
-# =========================
-# Drain ADO agents
-# =========================
-Write-Log "Disabling ADO agents to drain VM..."
-Set-AllAgentsEnabledState `
-    -VmAgents $vmAgents `
-    -Organization $AdoOrganization `
-    -PoolId $PoolId `
-    -Enabled $false `
-    -Headers $Headers
-
-Start-Sleep -Seconds $DrainWaitSeconds
-
-# Re-check after drain
-Write-Log "Re-checking agents after drain..."
-$allAgents = Get-AdoAgentsInPool -Organization $AdoOrganization -PoolId $PoolId -Headers $Headers
-$vmAgents = Get-AdoAgentsForVm -Agents $allAgents -ExpectedAgentNames $ExpectedAgents
-
-$agentSummary = $vmAgents | Select-Object name, status, enabled, @{Name="Busy";Expression={ $null -ne $_.assignedRequest }}
-$agentSummary | Format-Table -AutoSize | Out-String | Write-Host
-
-if (-not (Test-AllVmAgentsIdle -VmAgents $vmAgents)) {
-    Write-Log "VM is not safe after drain re-check. Re-enabling ADO agents."
-    Set-AllAgentsEnabledState `
-        -VmAgents $vmAgents `
-        -Organization $AdoOrganization `
-        -PoolId $PoolId `
-        -Enabled $true `
-        -Headers $Headers
-
-    throw "Not idle after drain re-check."
-}
-
-Write-Log "Drain successful. Proceeding to stop Azure Pipelines services and patch."
-
-# =========================
-# Stage 1: Stop services + baseline + patch
-# =========================
-$stage1Script = @'
-param(
-    [string]$LogFolder = "C:\PatchAutomation"
-)
-
-$ErrorActionPreference = "Stop"
-New-Item -ItemType Directory -Force -Path $LogFolder | Out-Null
-$logFile = Join-Path $LogFolder ("stage1-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
-
-function Write-Log {
-    param([string]$Message)
-    $line = "$(Get-Date -Format s) $Message"
-    $line | Tee-Object -FilePath $logFile -Append | Out-Null
-}
-
-Write-Log "Capturing pre-patch PowerShell and module baseline"
-
-$PSVersionTable | Out-File (Join-Path $LogFolder "psversion-before.txt") -Force
-
-Get-Module -ListAvailable |
-    Select-Object Name, Version |
-    Sort-Object Name, Version -Unique |
-    Export-Csv (Join-Path $LogFolder "modules-before.csv") -NoTypeInformation
-
-Write-Log "Stopping Azure Pipelines services"
-$svc = Get-Service | Where-Object { $_.DisplayName -like "Azure Pipelines*" }
-
-if (-not $svc) {
-    throw "No Azure Pipelines services found."
-}
-
-$svc | Select-Object Name, DisplayName, Status | Format-Table -AutoSize | Out-String |
-    Out-File (Join-Path $LogFolder "services-before-stop.txt") -Force
-
-foreach ($service in $svc) {
-    if ($service.Status -ne "Stopped") {
-        Stop-Service -Name $service.Name -Force
-    }
-}
-
-$serviceStopDeadline = (Get-Date).AddMinutes(2)
-$allStopped = $false
-
-while ((Get-Date) -lt $serviceStopDeadline) {
-    $currentServices = Get-Service | Where-Object { $_.DisplayName -like "Azure Pipelines*" }
-
-    if (($currentServices | Where-Object { $_.Status -ne "Stopped" }).Count -eq 0) {
-        $allStopped = $true
-        break
-    }
-
-    Start-Sleep -Seconds 5
-}
-
-$currentServices = Get-Service | Where-Object { $_.DisplayName -like "Azure Pipelines*" }
-$currentServices | Select-Object Name, DisplayName, Status | Format-Table -AutoSize | Out-String |
-    Out-File (Join-Path $LogFolder "services-after-stop.txt") -Force
-
-if (-not $allStopped) {
-    throw "Not all Azure Pipelines services stopped within timeout."
-}
-
-Write-Log "All Azure Pipelines services are fully stopped."
-
-Write-Log "Ensuring PSWindowsUpdate exists"
-if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
-    Install-PackageProvider -Name NuGet -Force
-    Install-Module -Name PSWindowsUpdate -Force -AllowClobber
-}
-
-Import-Module PSWindowsUpdate
-
-Write-Log "Scanning for applicable Security updates"
-$updates = Get-WindowsUpdate -Category "Security Updates" -MicrosoftUpdate
-
-if (-not $updates) {
-    Write-Log "No applicable security updates found"
-    "NO_UPDATES" | Out-File (Join-Path $LogFolder "stage1-result.txt") -Force
-    exit 0
-}
-
-$updates |
-    Select-Object Title, KB, Size |
-    Format-Table -AutoSize |
-    Out-String |
-    Out-File (Join-Path $LogFolder "available-security-updates.txt") -Force
-
-Write-Log "Installing latest applicable Security updates"
-Install-WindowsUpdate -Category "Security Updates" -MicrosoftUpdate -AcceptAll -IgnoreReboot |
-    Tee-Object -FilePath (Join-Path $LogFolder "install-output.txt") -Append | Out-Null
-
-$rebootRequired = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
-
-if ($rebootRequired) {
-    Write-Log "Reboot required"
-    "REBOOT_REQUIRED" | Out-File (Join-Path $LogFolder "stage1-result.txt") -Force
-    Restart-Computer -Force
-}
-else {
-    Write-Log "No reboot required"
-    "COMPLETED_NO_REBOOT" | Out-File (Join-Path $LogFolder "stage1-result.txt") -Force
-}
-'@
-
-try {
-    Write-Log "Starting Stage 1 on VM..."
-    Invoke-AzVMRunCommand `
-        -ResourceGroupName $ResourceGroupName `
-        -VMName $VmName `
-        -CommandId "RunPowerShellScript" `
-        -ScriptString $stage1Script | Out-Null
-}
-catch {
-    Write-Log "Stage 1 failed. Agents remain disabled."
-    throw
-}
-
-# =========================
-# Wait for reboot/recovery
-# =========================
-Write-Log "Waiting for VM recovery..."
-$vmReady = Wait-ForVmGuestReady `
-    -ResourceGroupName $ResourceGroupName `
-    -VmName $VmName `
-    -TimeoutMinutes $VmBootTimeoutMinutes `
-    -PollSeconds $VmPollSeconds
-
-if (-not $vmReady) {
-    throw "VM did not recover within timeout. Agents remain disabled."
-}
-
-Write-Log "VM is back and guest commands are working."
-
-# =========================
-# Stage 2: baseline compare + start services
-# =========================
-$stage2Script = @'
-param(
-    [string]$LogFolder = "C:\PatchAutomation"
-)
-
-$ErrorActionPreference = "Stop"
-$logFile = Join-Path $LogFolder ("stage2-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
-
-function Write-Log {
-    param([string]$Message)
-    $line = "$(Get-Date -Format s) $Message"
-    $line | Tee-Object -FilePath $logFile -Append | Out-Null
-}
-
-Write-Log "Capturing post-patch PowerShell and module state"
-
-$PSVersionTable | Out-File (Join-Path $LogFolder "psversion-after.txt") -Force
-
-Get-Module -ListAvailable |
-    Select-Object Name, Version |
-    Sort-Object Name, Version -Unique |
-    Export-Csv (Join-Path $LogFolder "modules-after.csv") -NoTypeInformation
-
-$beforePath = Join-Path $LogFolder "modules-before.csv"
-$afterPath  = Join-Path $LogFolder "modules-after.csv"
-
-if ((Test-Path $beforePath) -and (Test-Path $afterPath)) {
-    $before = Import-Csv $beforePath
-    $after  = Import-Csv $afterPath
-
-    $diff = Compare-Object $before $after -Property Name, Version
-    if ($diff) {
-        $diff | Out-File (Join-Path $LogFolder "modules-diff.txt") -Force
-        Write-Log "Module differences detected"
-    }
-    else {
-        Write-Log "No module differences detected"
-    }
-}
-
-Write-Log "Starting Azure Pipelines services"
-$svc = Get-Service | Where-Object { $_.DisplayName -like "Azure Pipelines*" }
-
-if (-not $svc) {
-    throw "No Azure Pipelines services found."
-}
-
-foreach ($service in $svc) {
-    if ($service.Status -ne "Running") {
-        Start-Service -Name $service.Name
-    }
-}
-
-$serviceStartDeadline = (Get-Date).AddMinutes(2)
-$allRunning = $false
-
-while ((Get-Date) -lt $serviceStartDeadline) {
-    $currentServices = Get-Service | Where-Object { $_.DisplayName -like "Azure Pipelines*" }
-
-    if (($currentServices | Where-Object { $_.Status -ne "Running" }).Count -eq 0) {
-        $allRunning = $true
-        break
-    }
-
-    Start-Sleep -Seconds 5
-}
-
-$currentServices = Get-Service | Where-Object { $_.DisplayName -like "Azure Pipelines*" }
-$currentServices | Select-Object Name, DisplayName, Status | Format-Table -AutoSize | Out-String |
-    Out-File (Join-Path $LogFolder "services-after-start.txt") -Force
-
-if (-not $allRunning) {
-    throw "Not all Azure Pipelines services started within timeout."
-}
-
-Write-Log "All Azure Pipelines services are fully running."
-
-$rebootRequired = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
-if ($rebootRequired) {
-    "REBOOT_STILL_REQUIRED" | Out-File (Join-Path $LogFolder "stage2-result.txt") -Force
-    exit 3
-}
-
-"SERVICE_VALIDATION_COMPLETE" | Out-File (Join-Path $LogFolder "stage2-result.txt") -Force
-Write-Output "SERVICE_VALIDATION_COMPLETE"
-'@
-
-try {
-    Write-Log "Starting Stage 2 on VM..."
-    $stage2 = Invoke-AzVMRunCommand `
-        -ResourceGroupName $ResourceGroupName `
-        -VMName $VmName `
-        -CommandId "RunPowerShellScript" `
-        -ScriptString $stage2Script
-
-    $stage2Output = ($stage2.Value | ForEach-Object { $_.Message }) -join "`n"
-
-    if ($stage2Output -notmatch "SERVICE_VALIDATION_COMPLETE") {
-        throw "Stage 2 validation did not confirm success."
-    }
-}
-catch {
-    Write-Log "Stage 2 failed. Agents remain disabled."
-    throw
-}
-
-# =========================
-# Re-enable ADO agents
-# =========================
-Write-Log "Re-enabling ADO agents..."
-$allAgents = Get-AdoAgentsInPool -Organization $AdoOrganization -PoolId $PoolId -Headers $Headers
-$vmAgents = Get-AdoAgentsForVm -Agents $allAgents -ExpectedAgentNames $ExpectedAgents
-
-Set-AllAgentsEnabledState `
-    -VmAgents $vmAgents `
-    -Organization $AdoOrganization `
-    -PoolId $PoolId `
-    -Enabled $true `
-    -Headers $Headers
-
-Write-Log "Patch flow completed successfully."
-Write-Host ""
-Write-Host "Artifacts on VM should be under: C:\PatchAutomation"
+You are helping me perform a security-focused repository investigation for an API that may have exposed sensitive data through a reporting endpoint. I only have the repositories right now. I need you to inspect this repo and produce a clear, evidence-based inventory.
+
+Goal:
+Determine whether this repo contains API code, whether it likely hosts or contributes to a service related to report.api, whether Swagger/OpenAPI exists, how the API is authenticated, where sensitive query/report logic may live, whether there are deployment signals, and what evidence suggests the service talks to a database such as Snowflake.
+
+Instructions:
+1. Search the full repository, not just obvious files.
+2. Be precise. Do not guess. For every conclusion, cite the file path and relevant code snippet or config line.
+3. If something is unclear, say “unclear” and explain what evidence is missing.
+4. Group findings into sections with headings.
+5. At the end, provide a short risk-focused summary specifically for API security testing.
+
+Tasks:
+
+A. Identify whether this repo contains API code
+- Find all route definitions, controllers, handlers, routers, resolvers, or endpoint declarations.
+- Infer the backend framework if possible (.NET, Java Spring Boot, Node/Express/NestJS, Python Flask/FastAPI/Django, GraphQL, other).
+- Produce a table with:
+  - HTTP method
+  - path or route
+  - file path
+  - handler/controller name
+  - authentication or authorization middleware/attribute/guard if visible
+  - notes on whether the endpoint looks report-related, admin-only, internal, or public
+
+Search broadly for patterns such as:
+- Java: @RequestMapping, @GetMapping, @PostMapping, @PutMapping, @DeleteMapping, @PatchMapping, @RestController
+- Node: app.get, app.post, router.get, router.post, @Controller, @Get, @Post
+- Python: @app.route, @app.get, @app.post, APIRouter, path(, re_path(
+- .NET: [Route(, [HttpGet], [HttpPost], [HttpPut], [HttpDelete], [HttpPatch], ControllerBase, MapGet, MapPost
+- GraphQL: type Query, type Mutation, resolver
+
+B. Find anything specifically related to reporting or report.api
+- Search for strings such as:
+  - report
+  - reports
+  - report.api
+  - reporting
+  - export
+  - analytics
+  - query
+  - sql
+  - statement
+  - execute
+  - filter
+  - tenant
+  - tenantId
+  - customerId
+  - sensitive
+- Identify files, classes, functions, routes, or services that appear to generate reports, build queries, filter data, or return bulk/sensitive data.
+- Highlight any code that appears to:
+  - construct SQL dynamically
+  - pass user input into query builders
+  - map request parameters into database filters
+  - bypass tenant/user scoping
+  - support export/download functionality
+
+C. Determine whether Swagger/OpenAPI exists
+Check for all of the following:
+1. OpenAPI/Swagger files in the repo:
+- swagger.json
+- swagger.yaml
+- openapi.json
+- openapi.yaml
+- api-docs
+- docs folders with spec files
+
+2. Framework/code support for generating Swagger/OpenAPI:
+- .NET: AddSwaggerGen, UseSwagger, UseSwaggerUI, OpenApi
+- Java: springdoc, springfox, @OpenAPIDefinition, @Operation
+- Node: swagger-ui-express, swagger-jsdoc, openapi
+- Python: FastAPI autogenerated docs, swagger config, OpenAPI config
+- Any annotations, decorators, generators, or packages related to Swagger/OpenAPI
+
+3. Pipeline/build/deploy references to spec generation or publishing:
+- .gitlab-ci.yml
+- included CI YAML files
+- build scripts
+- artifact generation
+- commands that export swagger/openapi/json/yaml
+
+Output:
+- State clearly whether Swagger/OpenAPI appears to exist:
+  - yes, as files
+  - yes, generated by app/framework
+  - yes, referenced in pipeline/build
+  - no clear evidence
+- Provide all supporting file paths.
+
+D. Determine authentication and authorization patterns
+Find evidence of:
+- JWT or bearer token auth
+- OAuth/OpenID Connect
+- API keys
+- session auth
+- custom middleware or guards
+- role checks
+- policy checks
+- tenant checks
+- claims-based authorization
+- admin vs normal user separation
+
+Output:
+- Summarize how a normal user likely authenticates
+- Summarize how authorization is enforced on endpoints
+- Identify any report-related endpoints that appear weakly protected or unclear
+
+E. Determine data/backend connectivity, especially Snowflake
+Search for evidence of:
+- Snowflake SDKs, drivers, packages, connectors
+- connection strings
+- environment variables
+- SQL clients
+- repository/data-access layers
+- ORM usage
+- direct SQL execution
+- warehouse/database/schema references
+
+Search terms to include:
+- snowflake
+- snowflake-connector
+- SnowflakeDb
+- jdbc:snowflake
+- odbc
+- warehouse
+- database
+- schema
+- query
+- execute
+- cursor
+- select
+- from
+- sqlalchemy
+- Dapper
+- EntityFramework
+- DbContext
+- SqlCommand
+- Npgsql
+- JdbcTemplate
+- repository
+
+Output:
+- Does this repo appear to talk directly to Snowflake?
+- If yes, where and how?
+- If not, is there evidence it calls another internal service that may do so?
+
+F. Determine whether the service is deployable and likely active
+Find deployment/build signals such as:
+- .gitlab-ci.yml
+- included CI files
+- Dockerfile
+- docker-compose
+- Helm charts
+- values.yaml
+- k8s manifests
+- appsettings files
+- .env or env templates
+- terraform references
+- build.gradle, pom.xml, package.json, requirements.txt, pyproject.toml, csproj, sln
+
+Output:
+- Is this repo likely a real deployable service?
+- What environment or hostname clues exist?
+- Any clues about public vs internal exposure?
+
+G. Logging and audit visibility
+Search for:
+- API request logging
+- gateway/correlation IDs
+- structured logging
+- query logging
+- audit trails
+- security logging
+- exception logging around report execution
+- references to Splunk, ELK, App Insights, Log Analytics, Datadog, CloudWatch, etc.
+
+Output:
+- Where would I likely look for logs related to suspicious report API calls?
+- Does the code log request parameters, user identity, tenant, or query execution?
+- Are there any gaps where logs appear insufficient?
+
+H. Security-focused endpoint shortlist
+Based on all findings, build a final shortlist of endpoints or handlers that should be tested first for:
+- broken object level authorization
+- broken function level authorization
+- weak tenant scoping
+- dangerous filtering/query parameters
+- export/download overreach
+- injection risk
+- hidden/internal endpoints exposed through normal auth
+
+For each shortlisted item include:
+- endpoint/path
+- why it is risky
+- what kind of test should be performed as a normal user
+
+Required final output format:
+
+1. Repo summary
+2. Framework detected
+3. API inventory table
+4. Report/reporting-related findings
+5. Swagger/OpenAPI findings
+6. Auth/authz findings
+7. Data access and Snowflake findings
+8. Deployability findings
+9. Logging findings
+10. High-priority endpoints to test
+11. Gaps / unknowns
+12. Final risk-focused summary for a security engineer investigating possible sensitive-data exposure via report.api
+
+Important:
+- Quote only short relevant snippets, not whole files.
+- Always include the file path for each finding.
+- If multiple services exist in the repo, separate them.
+- If this repo does not appear to contain the API itself, say so clearly and identify what it does appear to contain instead.
+
+
+
+
+
+
+Now validate your own findings.
+1. Re-check every conclusion and remove anything speculative.
+2. Highlight the top 10 most important files I should inspect manually first.
+3. Build a condensed table only for report-related endpoints and data-access code.
+4. Tell me whether this repo is:
+- definitely hosts the API
+- likely hosts the API
+- supports the API indirectly
+- unrelated
+5. Tell me exactly what evidence would confirm Swagger/OpenAPI exists in this repo.
+6. Tell me exactly what evidence would confirm a normal user can or cannot access report-related data.
+
+
+
+
+Search this repository specifically for Swagger/OpenAPI evidence.
+
+Check for:
+- swagger.json, swagger.yaml, openapi.json, openapi.yaml
+- AddSwaggerGen, UseSwagger, UseSwaggerUI
+- springdoc, springfox, @OpenAPIDefinition, @Operation
+- swagger-ui-express, swagger-jsdoc, openapi
+- FastAPI automatic docs config
+- CI/CD steps that generate or publish API specs
+- references to /swagger, /openapi, /api-docs
+
+Return:
+1. exact file paths
+2. short evidence snippets
+3. whether the spec is stored as a file, generated by framework, or referenced in pipeline
+4. if absent, say “no clear Swagger/OpenAPI evidence found”
