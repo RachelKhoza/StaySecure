@@ -218,7 +218,7 @@ Important:
 
 
 
-
+----------------------------------------------------------------------------------------------------------------------------
 
 Now validate your own findings.
 1. Re-check every conclusion and remove anything speculative.
@@ -233,6 +233,8 @@ Now validate your own findings.
 6. Tell me exactly what evidence would confirm a normal user can or cannot access report-related data.
 
 
+
+----------------------------------------------------------------------------------------------------------------------------
 
 
 Search this repository specifically for Swagger/OpenAPI evidence.
