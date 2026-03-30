@@ -3,27 +3,552 @@ param(
     [string]$ResourceGroupName,
 
     [Parameter(Mandatory = $true)]
-    [string]$VmName
+    [string]$VmName,
+
+    [string]$AdoOrganization = "Any",
+    [int]$IdleTimeoutMinutes = 60,
+    [int]$IdlePollSeconds = 60,
+    [int]$DrainWaitSeconds = 25,
+    [int]$VmBootTimeoutMinutes = 30,
+    [int]$VmPollSeconds = 30,
+
+    [switch]$CheckOnly
 )
 
 $ErrorActionPreference = "Stop"
 
-$script = @'
-Get-Service |
-    Where-Object {
-        $_.Name -like "vstsagent*" -or
-        $_.DisplayName -like "*Azure Pipelines*" -or
-        $_.DisplayName -like "*Agent*"
-    } |
-    Select-Object Name, DisplayName, Status, StartType |
-    Sort-Object Name |
-    Format-Table -AutoSize
+# =========================
+# Config: VM -> Pool + Agents
+# =========================
+$VmConfigMap = @{
+    "GLBL-SEA-P-AZDE" = @{
+        PoolId = 14
+        Agents = @(
+            "GLBLSEAP01",
+            "GLBLSEAP02",
+            "GLBLSEAP03",
+            "GLBLSEAP04"
+        )
+    }
+}
+
+# =========================
+# Helpers
+# =========================
+function Write-Log {
+    param([string]$Message)
+    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
+}
+
+function New-AdoAuthHeader {
+    param([string]$Pat)
+
+    $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Pat"))
+    @{
+        Authorization = "Basic $base64AuthInfo"
+        "Content-Type" = "application/json"
+    }
+}
+
+function Get-VmPatchConfig {
+    param(
+        [string]$VmName,
+        [hashtable]$VmConfigMap
+    )
+
+    if (-not $VmConfigMap.ContainsKey($VmName)) {
+        throw "No patch config found for VM '$VmName'"
+    }
+
+    $VmConfigMap[$VmName]
+}
+
+function Get-AdoAgentsInPool {
+    param(
+        [string]$Organization,
+        [int]$PoolId,
+        [hashtable]$Headers
+    )
+
+    $uri = "https://dev.azure.com/$Organization/_apis/distributedtask/pools/$PoolId/agents?includeAssignedRequest=true&includeCapabilities=true&api-version=7.1"
+    (Invoke-RestMethod -Uri $uri -Headers $Headers -Method Get).value
+}
+
+function Get-AdoAgentsForVm {
+    param(
+        [array]$Agents,
+        [string[]]$ExpectedAgentNames
+    )
+
+    $matchedAgents = $Agents | Where-Object { $ExpectedAgentNames -contains $_.name }
+
+    if (-not $matchedAgents -or $matchedAgents.Count -eq 0) {
+        throw "No mapped ADO agents found in pool."
+    }
+
+    $matchedAgents
+}
+
+function Test-AdoAgentBusy {
+    param($Agent)
+
+    if ($null -ne $Agent.assignedRequest) { return $true }
+    return $false
+}
+
+function Test-AllVmAgentsIdle {
+    param([array]$VmAgents)
+
+    foreach ($agent in $VmAgents) {
+        if ($agent.status -ne "online") {
+            Write-Log "Agent $($agent.name) is not online. Status: $($agent.status)"
+            return $false
+        }
+
+        if (Test-AdoAgentBusy -Agent $agent) {
+            Write-Log "Agent $($agent.name) is busy."
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Set-AdoAgentEnabledState {
+    param(
+        [string]$Organization,
+        [int]$PoolId,
+        [int]$AgentId,
+        [string]$AgentName,
+        [bool]$Enabled,
+        [hashtable]$Headers
+    )
+
+    $uri = "https://dev.azure.com/$Organization/_apis/distributedtask/pools/$PoolId/agents/$AgentId?api-version=7.1"
+
+    $body = @{
+        id      = $AgentId
+        enabled = $Enabled
+        name    = $AgentName
+    } | ConvertTo-Json
+
+    Invoke-RestMethod -Uri $uri -Headers $Headers -Method Patch -Body $body | Out-Null
+}
+
+function Set-AllAgentsEnabledState {
+    param(
+        [array]$VmAgents,
+        [string]$Organization,
+        [int]$PoolId,
+        [bool]$Enabled,
+        [hashtable]$Headers
+    )
+
+    foreach ($agent in $VmAgents) {
+        Write-Log "Setting agent $($agent.name) enabled=$Enabled"
+        Set-AdoAgentEnabledState `
+            -Organization $Organization `
+            -PoolId $PoolId `
+            -AgentId $agent.id `
+            -AgentName $agent.name `
+            -Enabled $Enabled `
+            -Headers $Headers
+    }
+}
+
+function Wait-ForVmGuestReady {
+    param(
+        [string]$ResourceGroupName,
+        [string]$VmName,
+        [int]$TimeoutMinutes = 30,
+        [int]$PollSeconds = 30
+    )
+
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $current = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VmName -Status
+            $powerState = ($current.Statuses | Where-Object Code -like 'PowerState/*').DisplayStatus
+
+            if ($powerState -eq "VM running") {
+                $probe = Invoke-AzVMRunCommand `
+                    -ResourceGroupName $ResourceGroupName `
+                    -VMName $VmName `
+                    -CommandId "RunPowerShellScript" `
+                    -ScriptString 'Write-Output "VM_GUEST_READY"'
+
+                $msg = ($probe.Value | ForEach-Object { $_.Message }) -join "`n"
+                if ($msg -match "VM_GUEST_READY") {
+                    return $true
+                }
+            }
+        }
+        catch {
+        }
+
+        Start-Sleep -Seconds $PollSeconds
+    }
+
+    return $false
+}
+
+# =========================
+# PAT / Config
+# =========================
+$AdoPat = $env:ADO_PAT
+if (-not $AdoPat) {
+    throw "Environment variable ADO_PAT is not set."
+}
+
+$vmConfig = Get-VmPatchConfig -VmName $VmName -VmConfigMap $VmConfigMap
+$PoolId = $vmConfig.PoolId
+$ExpectedAgents = $vmConfig.Agents
+$Headers = New-AdoAuthHeader -Pat $AdoPat
+
+Write-Log "Resolved VM config: VM=$VmName PoolId=$PoolId Agents=$($ExpectedAgents -join ', ')"
+
+# =========================
+# VM Power Check
+# =========================
+$vmStatus = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VmName -Status
+$powerState = ($vmStatus.Statuses | Where-Object Code -like "PowerState/*").DisplayStatus
+
+if ($powerState -ne "VM running") {
+    throw "VM $VmName is not running. Current state: $powerState"
+}
+
+Write-Log "VM is running."
+
+# =========================
+# Wait for Idle
+# =========================
+Write-Log "Checking ADO agents for idle state..."
+$idleDeadline = (Get-Date).AddMinutes($IdleTimeoutMinutes)
+$idleConfirmed = $false
+$vmAgents = $null
+
+while ((Get-Date) -lt $idleDeadline) {
+    $allAgents = Get-AdoAgentsInPool -Organization $AdoOrganization -PoolId $PoolId -Headers $Headers
+    $vmAgents = Get-AdoAgentsForVm -Agents $allAgents -ExpectedAgentNames $ExpectedAgents
+
+    $agentSummary = $vmAgents | Select-Object name, status, enabled, @{Name="Busy";Expression={ $null -ne $_.assignedRequest }}
+    $agentSummary | Format-Table -AutoSize | Out-String | Write-Host
+
+    if (Test-AllVmAgentsIdle -VmAgents $vmAgents) {
+        $idleConfirmed = $true
+        break
+    }
+
+    Write-Log "Agents not idle yet. Waiting $IdlePollSeconds seconds..."
+    Start-Sleep -Seconds $IdlePollSeconds
+}
+
+if (-not $idleConfirmed) {
+    throw "Timed out waiting for all agents on VM $VmName to become idle."
+}
+
+Write-Log "All mapped agents are idle."
+
+if ($CheckOnly) {
+    Write-Log "CheckOnly specified. Exiting before drain and patch."
+    return
+}
+
+# =========================
+# Drain ADO agents
+# =========================
+Write-Log "Disabling ADO agents to drain VM..."
+Set-AllAgentsEnabledState `
+    -VmAgents $vmAgents `
+    -Organization $AdoOrganization `
+    -PoolId $PoolId `
+    -Enabled $false `
+    -Headers $Headers
+
+Start-Sleep -Seconds $DrainWaitSeconds
+
+# Re-check after drain
+Write-Log "Re-checking agents after drain..."
+$allAgents = Get-AdoAgentsInPool -Organization $AdoOrganization -PoolId $PoolId -Headers $Headers
+$vmAgents = Get-AdoAgentsForVm -Agents $allAgents -ExpectedAgentNames $ExpectedAgents
+
+$agentSummary = $vmAgents | Select-Object name, status, enabled, @{Name="Busy";Expression={ $null -ne $_.assignedRequest }}
+$agentSummary | Format-Table -AutoSize | Out-String | Write-Host
+
+if (-not (Test-AllVmAgentsIdle -VmAgents $vmAgents)) {
+    Write-Log "VM is not safe after drain re-check. Re-enabling ADO agents."
+    Set-AllAgentsEnabledState `
+        -VmAgents $vmAgents `
+        -Organization $AdoOrganization `
+        -PoolId $PoolId `
+        -Enabled $true `
+        -Headers $Headers
+
+    throw "Not idle after drain re-check."
+}
+
+Write-Log "Drain successful. Proceeding to stop Azure Pipelines services and patch."
+
+# =========================
+# Stage 1: Stop services + baseline + patch
+# =========================
+$stage1Script = @'
+param(
+    [string]$LogFolder = "C:\PatchAutomation"
+)
+
+$ErrorActionPreference = "Stop"
+New-Item -ItemType Directory -Force -Path $LogFolder | Out-Null
+$logFile = Join-Path $LogFolder ("stage1-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+
+function Write-Log {
+    param([string]$Message)
+    $line = "$(Get-Date -Format s) $Message"
+    $line | Tee-Object -FilePath $logFile -Append | Out-Null
+}
+
+Write-Log "Capturing pre-patch PowerShell and module baseline"
+
+$PSVersionTable | Out-File (Join-Path $LogFolder "psversion-before.txt") -Force
+
+Get-Module -ListAvailable |
+    Select-Object Name, Version |
+    Sort-Object Name, Version -Unique |
+    Export-Csv (Join-Path $LogFolder "modules-before.csv") -NoTypeInformation
+
+Write-Log "Stopping Azure Pipelines services"
+$svc = Get-Service | Where-Object { $_.DisplayName -like "Azure Pipelines*" }
+
+if (-not $svc) {
+    throw "No Azure Pipelines services found."
+}
+
+$svc | Select-Object Name, DisplayName, Status | Format-Table -AutoSize | Out-String |
+    Out-File (Join-Path $LogFolder "services-before-stop.txt") -Force
+
+foreach ($service in $svc) {
+    if ($service.Status -ne "Stopped") {
+        Stop-Service -Name $service.Name -Force
+    }
+}
+
+$serviceStopDeadline = (Get-Date).AddMinutes(2)
+$allStopped = $false
+
+while ((Get-Date) -lt $serviceStopDeadline) {
+    $currentServices = Get-Service | Where-Object { $_.DisplayName -like "Azure Pipelines*" }
+
+    if (($currentServices | Where-Object { $_.Status -ne "Stopped" }).Count -eq 0) {
+        $allStopped = $true
+        break
+    }
+
+    Start-Sleep -Seconds 5
+}
+
+$currentServices = Get-Service | Where-Object { $_.DisplayName -like "Azure Pipelines*" }
+$currentServices | Select-Object Name, DisplayName, Status | Format-Table -AutoSize | Out-String |
+    Out-File (Join-Path $LogFolder "services-after-stop.txt") -Force
+
+if (-not $allStopped) {
+    throw "Not all Azure Pipelines services stopped within timeout."
+}
+
+Write-Log "All Azure Pipelines services are fully stopped."
+
+Write-Log "Ensuring PSWindowsUpdate exists"
+if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+    Install-PackageProvider -Name NuGet -Force
+    Install-Module -Name PSWindowsUpdate -Force -AllowClobber
+}
+
+Import-Module PSWindowsUpdate
+
+Write-Log "Scanning for applicable Security updates"
+$updates = Get-WindowsUpdate -Category "Security Updates" -MicrosoftUpdate
+
+if (-not $updates) {
+    Write-Log "No applicable security updates found"
+    "NO_UPDATES" | Out-File (Join-Path $LogFolder "stage1-result.txt") -Force
+    exit 0
+}
+
+$updates |
+    Select-Object Title, KB, Size |
+    Format-Table -AutoSize |
+    Out-String |
+    Out-File (Join-Path $LogFolder "available-security-updates.txt") -Force
+
+Write-Log "Installing latest applicable Security updates"
+Install-WindowsUpdate -Category "Security Updates" -MicrosoftUpdate -AcceptAll -IgnoreReboot |
+    Tee-Object -FilePath (Join-Path $LogFolder "install-output.txt") -Append | Out-Null
+
+$rebootRequired = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+
+if ($rebootRequired) {
+    Write-Log "Reboot required"
+    "REBOOT_REQUIRED" | Out-File (Join-Path $LogFolder "stage1-result.txt") -Force
+    Restart-Computer -Force
+}
+else {
+    Write-Log "No reboot required"
+    "COMPLETED_NO_REBOOT" | Out-File (Join-Path $LogFolder "stage1-result.txt") -Force
+}
 '@
 
-$result = Invoke-AzVMRunCommand `
-    -ResourceGroupName $ResourceGroupName `
-    -VMName $VmName `
-    -CommandId 'RunPowerShellScript' `
-    -ScriptString $script
+try {
+    Write-Log "Starting Stage 1 on VM..."
+    Invoke-AzVMRunCommand `
+        -ResourceGroupName $ResourceGroupName `
+        -VMName $VmName `
+        -CommandId "RunPowerShellScript" `
+        -ScriptString $stage1Script | Out-Null
+}
+catch {
+    Write-Log "Stage 1 failed. Agents remain disabled."
+    throw
+}
 
-($result.Value | ForEach-Object { $_.Message }) -join "`n"
+# =========================
+# Wait for reboot/recovery
+# =========================
+Write-Log "Waiting for VM recovery..."
+$vmReady = Wait-ForVmGuestReady `
+    -ResourceGroupName $ResourceGroupName `
+    -VmName $VmName `
+    -TimeoutMinutes $VmBootTimeoutMinutes `
+    -PollSeconds $VmPollSeconds
+
+if (-not $vmReady) {
+    throw "VM did not recover within timeout. Agents remain disabled."
+}
+
+Write-Log "VM is back and guest commands are working."
+
+# =========================
+# Stage 2: baseline compare + start services
+# =========================
+$stage2Script = @'
+param(
+    [string]$LogFolder = "C:\PatchAutomation"
+)
+
+$ErrorActionPreference = "Stop"
+$logFile = Join-Path $LogFolder ("stage2-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+
+function Write-Log {
+    param([string]$Message)
+    $line = "$(Get-Date -Format s) $Message"
+    $line | Tee-Object -FilePath $logFile -Append | Out-Null
+}
+
+Write-Log "Capturing post-patch PowerShell and module state"
+
+$PSVersionTable | Out-File (Join-Path $LogFolder "psversion-after.txt") -Force
+
+Get-Module -ListAvailable |
+    Select-Object Name, Version |
+    Sort-Object Name, Version -Unique |
+    Export-Csv (Join-Path $LogFolder "modules-after.csv") -NoTypeInformation
+
+$beforePath = Join-Path $LogFolder "modules-before.csv"
+$afterPath  = Join-Path $LogFolder "modules-after.csv"
+
+if ((Test-Path $beforePath) -and (Test-Path $afterPath)) {
+    $before = Import-Csv $beforePath
+    $after  = Import-Csv $afterPath
+
+    $diff = Compare-Object $before $after -Property Name, Version
+    if ($diff) {
+        $diff | Out-File (Join-Path $LogFolder "modules-diff.txt") -Force
+        Write-Log "Module differences detected"
+    }
+    else {
+        Write-Log "No module differences detected"
+    }
+}
+
+Write-Log "Starting Azure Pipelines services"
+$svc = Get-Service | Where-Object { $_.DisplayName -like "Azure Pipelines*" }
+
+if (-not $svc) {
+    throw "No Azure Pipelines services found."
+}
+
+foreach ($service in $svc) {
+    if ($service.Status -ne "Running") {
+        Start-Service -Name $service.Name
+    }
+}
+
+$serviceStartDeadline = (Get-Date).AddMinutes(2)
+$allRunning = $false
+
+while ((Get-Date) -lt $serviceStartDeadline) {
+    $currentServices = Get-Service | Where-Object { $_.DisplayName -like "Azure Pipelines*" }
+
+    if (($currentServices | Where-Object { $_.Status -ne "Running" }).Count -eq 0) {
+        $allRunning = $true
+        break
+    }
+
+    Start-Sleep -Seconds 5
+}
+
+$currentServices = Get-Service | Where-Object { $_.DisplayName -like "Azure Pipelines*" }
+$currentServices | Select-Object Name, DisplayName, Status | Format-Table -AutoSize | Out-String |
+    Out-File (Join-Path $LogFolder "services-after-start.txt") -Force
+
+if (-not $allRunning) {
+    throw "Not all Azure Pipelines services started within timeout."
+}
+
+Write-Log "All Azure Pipelines services are fully running."
+
+$rebootRequired = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+if ($rebootRequired) {
+    "REBOOT_STILL_REQUIRED" | Out-File (Join-Path $LogFolder "stage2-result.txt") -Force
+    exit 3
+}
+
+"SERVICE_VALIDATION_COMPLETE" | Out-File (Join-Path $LogFolder "stage2-result.txt") -Force
+Write-Output "SERVICE_VALIDATION_COMPLETE"
+'@
+
+try {
+    Write-Log "Starting Stage 2 on VM..."
+    $stage2 = Invoke-AzVMRunCommand `
+        -ResourceGroupName $ResourceGroupName `
+        -VMName $VmName `
+        -CommandId "RunPowerShellScript" `
+        -ScriptString $stage2Script
+
+    $stage2Output = ($stage2.Value | ForEach-Object { $_.Message }) -join "`n"
+
+    if ($stage2Output -notmatch "SERVICE_VALIDATION_COMPLETE") {
+        throw "Stage 2 validation did not confirm success."
+    }
+}
+catch {
+    Write-Log "Stage 2 failed. Agents remain disabled."
+    throw
+}
+
+# =========================
+# Re-enable ADO agents
+# =========================
+Write-Log "Re-enabling ADO agents..."
+$allAgents = Get-AdoAgentsInPool -Organization $AdoOrganization -PoolId $PoolId -Headers $Headers
+$vmAgents = Get-AdoAgentsForVm -Agents $allAgents -ExpectedAgentNames $ExpectedAgents
+
+Set-AllAgentsEnabledState `
+    -VmAgents $vmAgents `
+    -Organization $AdoOrganization `
+    -PoolId $PoolId `
+    -Enabled $true `
+    -Headers $Headers
+
+Write-Log "Patch flow completed successfully."
+Write-Host ""
+Write-Host "Artifacts on VM should be under: C:\PatchAutomation"
