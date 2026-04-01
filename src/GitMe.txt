@@ -1,0 +1,204 @@
+param(
+    [string]$AdoOrganization = "Any",
+    [int]$PoolId = 14,
+    [string]$AgentName = "GLBLSEAP01",
+    [switch]$DryRun,
+    [int]$ReEnableAfterSeconds = 0
+)
+
+$ErrorActionPreference = "Stop"
+
+function Write-Log {
+    param([string]$Message)
+    Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message"
+}
+
+function New-AdoAuthHeader {
+    param([Parameter(Mandatory = $true)][string]$Pat)
+
+    $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Pat"))
+    return @{
+        Authorization = "Basic $base64AuthInfo"
+        "Content-Type" = "application/json"
+    }
+}
+
+function Get-AdoAgentsInPool {
+    param(
+        [Parameter(Mandatory = $true)][string]$Organization,
+        [Parameter(Mandatory = $true)][int]$PoolId,
+        [Parameter(Mandatory = $true)][hashtable]$Headers
+    )
+
+    $uri = "https://dev.azure.com/$Organization/_apis/distributedtask/pools/$PoolId/agents?includeAssignedRequest=true&includeCapabilities=true&api-version=7.1"
+    Write-Log "GET path:"
+    Write-Host $uri
+    Write-Host ""
+
+    return (Invoke-RestMethod -Uri $uri -Headers $Headers -Method Get).value
+}
+
+function Set-AdoAgentEnabledState {
+    param(
+        [Parameter(Mandatory = $true)][string]$Organization,
+        [Parameter(Mandatory = $true)][int]$PoolId,
+        [Parameter(Mandatory = $true)][int]$AgentId,
+        [Parameter(Mandatory = $true)][bool]$Enabled,
+        [Parameter(Mandatory = $true)][hashtable]$Headers
+    )
+
+    $uri = "https://dev.azure.com/$Organization/_apis/distributedtask/pools/$PoolId/agents/$AgentId?api-version=7.1"
+    $body = @{
+        enabled = $Enabled
+    } | ConvertTo-Json
+
+    Write-Log "PATCH path:"
+    Write-Host $uri
+    Write-Host ""
+    Write-Log "PATCH body:"
+    Write-Host $body
+    Write-Host ""
+
+    Invoke-RestMethod -Uri $uri -Headers $Headers -Method Patch -Body $body | Out-Null
+}
+
+# PAT from env var
+$AdoPat = $env:ADO_PAT
+if (-not $AdoPat) {
+    throw "Environment variable ADO_PAT is not set."
+}
+
+$Headers = New-AdoAuthHeader -Pat $AdoPat
+
+Write-Log "Starting one-agent drain test"
+Write-Log "Organization: $AdoOrganization"
+Write-Log "PoolId: $PoolId"
+Write-Log "Target agent: $AgentName"
+Write-Log "Mode: $(if ($DryRun) { 'DRY RUN' } else { 'REAL EXECUTION' })"
+Write-Host ""
+
+# Query pool and resolve one agent
+$allAgents = Get-AdoAgentsInPool -Organization $AdoOrganization -PoolId $PoolId -Headers $Headers
+
+if (-not $allAgents) {
+    throw "No agents returned from pool $PoolId."
+}
+
+$targetAgents = $allAgents | Where-Object { $_.name -eq $AgentName }
+
+if (-not $targetAgents) {
+    throw "Target agent '$AgentName' was not found in pool $PoolId."
+}
+
+if ($targetAgents.Count -ne 1) {
+    throw "Safety stop: Expected exactly 1 agent named '$AgentName' but found $($targetAgents.Count)."
+}
+
+$targetAgent = $targetAgents[0]
+$busy = $null -ne $targetAgent.assignedRequest
+
+Write-Log "Resolved target agent:"
+$targetAgent | Select-Object `
+    id,
+    name,
+    status,
+    enabled,
+    @{Name="Busy";Expression={ $busy }} |
+    Format-Table -AutoSize
+Write-Host ""
+
+Write-Log "Other agents in pool that will NOT be touched:"
+$allAgents |
+    Where-Object { $_.name -ne $AgentName } |
+    Select-Object id, name, status, enabled |
+    Format-Table -AutoSize
+Write-Host ""
+
+if ($targetAgent.status -ne "online") {
+    throw "Agent '$AgentName' is not online. Current status: $($targetAgent.status)"
+}
+
+if ($busy) {
+    throw "Agent '$AgentName' is currently busy. Refusing to disable it."
+}
+
+if (-not $targetAgent.enabled) {
+    throw "Agent '$AgentName' is already disabled."
+}
+
+if ($DryRun) {
+    Write-Log "DRY RUN ONLY"
+    Write-Host "No PATCH request was sent."
+    Write-Host "This script would disable ONLY agent '$AgentName' with id $($targetAgent.id)."
+    return
+}
+
+# Real disable
+Write-Log "Disabling agent '$AgentName' ..."
+Set-AdoAgentEnabledState `
+    -Organization $AdoOrganization `
+    -PoolId $PoolId `
+    -AgentId $targetAgent.id `
+    -Enabled $false `
+    -Headers $Headers
+
+Start-Sleep -Seconds 5
+
+Write-Log "Re-checking state after disable ..."
+$allAgentsAfterDisable = Get-AdoAgentsInPool -Organization $AdoOrganization -PoolId $PoolId -Headers $Headers
+$agentAfterDisable = $allAgentsAfterDisable | Where-Object { $_.name -eq $AgentName }
+
+$busyAfterDisable = $null -ne $agentAfterDisable.assignedRequest
+
+$agentAfterDisable | Select-Object `
+    id,
+    name,
+    status,
+    enabled,
+    @{Name="Busy";Expression={ $busyAfterDisable }} |
+    Format-Table -AutoSize
+Write-Host ""
+
+if ($agentAfterDisable.enabled -ne $false) {
+    throw "Disable failed. Agent '$AgentName' still appears enabled."
+}
+
+Write-Log "SUCCESS: Agent '$AgentName' is now disabled."
+
+if ($ReEnableAfterSeconds -gt 0) {
+    Write-Log "Waiting $ReEnableAfterSeconds seconds before re-enabling ..."
+    Start-Sleep -Seconds $ReEnableAfterSeconds
+
+    Write-Log "Re-enabling agent '$AgentName' ..."
+    Set-AdoAgentEnabledState `
+        -Organization $AdoOrganization `
+        -PoolId $PoolId `
+        -AgentId $targetAgent.id `
+        -Enabled $true `
+        -Headers $Headers
+
+    Start-Sleep -Seconds 5
+
+    Write-Log "Re-checking state after re-enable ..."
+    $allAgentsAfterEnable = Get-AdoAgentsInPool -Organization $AdoOrganization -PoolId $PoolId -Headers $Headers
+    $agentAfterEnable = $allAgentsAfterEnable | Where-Object { $_.name -eq $AgentName }
+    $busyAfterEnable = $null -ne $agentAfterEnable.assignedRequest
+
+    $agentAfterEnable | Select-Object `
+        id,
+        name,
+        status,
+        enabled,
+        @{Name="Busy";Expression={ $busyAfterEnable }} |
+        Format-Table -AutoSize
+    Write-Host ""
+
+    if ($agentAfterEnable.enabled -ne $true) {
+        throw "Re-enable failed. Agent '$AgentName' still appears disabled."
+    }
+
+    Write-Log "SUCCESS: Agent '$AgentName' is back online/enabled."
+}
+else {
+    Write-Log "Agent '$AgentName' was left disabled because ReEnableAfterSeconds was not specified."
+}
