@@ -1,1 +1,25 @@
 
+nfrastructure Patching Strategy
+Balancing System Maintenance with Customer Experience
+
+The Challenge
+Our production servers require routine security patching. The risk is that taking a server offline during patching could interrupt customer-triggered jobs — scheduled updates, portal changes, or deployments — with no warning. Three options were evaluated.
+
+Option 1 — Lock the Customer Portal During Maintenance
+Prevent customers from logging in or making changes while patching is in progress.
+Customer Experience: ❌ Poor — customers lose access with a hard stop on all activity
+AdvantagesDisadvantagesNo extra infrastructure costCustomers cannot access the portalStops new job triggers during the windowPre-scheduled updates still fire regardlessRequires significant frontend development effortBackground/system jobs may still runJob queue must be audited before every patch window
+
+Option 2 — Deploy a Secondary VM per Region
+Add a second low-spec VM to each region. Both VMs register agents to the same Azure DevOps pool. The pipeline dynamically routes jobs to whichever agent is available.
+Customer Experience: ✅ Zero disruption — customers see and feel nothing
+CurrentDuring PatchingAfter PatchingActive VMs11 (VM 2 only)2Active Agents448Customer Impact—NoneNone
+AdvantagesDisadvantagesZero customer-facing disruptionAdditional VM cost (low-spec, minimal)Scheduled updates continue uninterruptedRequires provisioning per regionNo frontend development neededMinor ongoing VM maintenancePipeline handles failover automaticallySimple to implement
+
+Option 3 — Cross-Region Traffic Rerouting
+Reroute West Europe traffic to another region if the primary goes down for patching.
+Customer Experience: ⚠️ Theoretically seamless — but not viable with current architecture
+AdvantagesDisadvantagesWould provide true cross-region failover if implementedEach region has its own isolated VNet and AD domainAD domain boundaries prevent cross-region PowerShell sessionsVery high implementation effort with uncertain outcomeWould require significant network and AD reconfiguration
+
+Environment Consideration
+EnvironmentConsiderationProductionCustomer impact is highest — any option chosen carries direct risk to the customer experienceTest & AcceptanceLower risk — patching during quiet windows with pre and post testing is a viable no-cost approach
