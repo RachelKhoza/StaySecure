@@ -1,4 +1,4 @@
-import db from '../../LovelyProject/src/db';
+import db from './db';
 
 // Use parameterized queries to avoid SQL injection
 export const addUser = async (

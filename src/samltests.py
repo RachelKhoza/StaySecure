@@ -7,7 +7,7 @@ import sys
 # 🔧  HARDCODED CONFIGURATION — adjust these before you run
 # ──────────────────────────────────────────────────────────────────────────────
 
-JIRA_BASE_URL   = "https://your-domain.atlassian.net"
+JIRA_BASE_URL   = "https://mydom.atlassian.net"
 JIRA_API_TOKEN  = "YOUR_API_TOKEN_HERE"
 SRC_TESTCASE    = "CORE-123"      # the Test Case you want to clone
 
