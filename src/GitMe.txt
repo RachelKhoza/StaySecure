@@ -1,1 +1,646 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Azure RBAC + PIM Access Review — PowerShell 5.1 Compatible
+#  ISO 27001: A.5.18 (Access rights) + A.8.2 (Privileged access)
+#
+#  PREREQUISITES (run once):
+#    Install-Module Microsoft.Graph -Scope CurrentUser -Force
+#    Install-Module Az              -Scope CurrentUser -Force
+# ═══════════════════════════════════════════════════════════════════════════════
 
+# ── CONFIG — edit these 3 lines ───────────────────────────────────────────────
+$ReviewedBy     = "Your Name"
+$SubscriptionId = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+$GroupPrefixes  = @("DRG-", "NORA-", "MGMT-")
+# ─────────────────────────────────────────────────────────────────────────────
+
+$ReviewDate = Get-Date -Format "yyyy-MM-dd"
+$OutputPath = ".\RBAC_Review_$ReviewDate.html"
+
+# ── HELPER: safe null check (PS 5.1 compatible, no ??) ────────────────────────
+function Coalesce($a, $b) { if ($null -ne $a -and $a -ne "") { $a } else { $b } }
+
+# ── CONNECT ───────────────────────────────────────────────────────────────────
+Write-Host "`n[1/5] Connecting to Azure..." -ForegroundColor Cyan
+Connect-AzAccount -SubscriptionId $SubscriptionId | Out-Null
+Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
+$SubName = (Get-AzContext).Subscription.Name
+Write-Host "      OK — $SubName" -ForegroundColor Green
+
+Write-Host "[2/5] Connecting to Microsoft Graph..." -ForegroundColor Cyan
+$Scopes = @(
+    "Group.Read.All",
+    "GroupMember.Read.All",
+    "User.Read.All",
+    "RoleManagement.Read.All",
+    "AuditLog.Read.All"
+)
+Connect-MgGraph -Scopes $Scopes | Out-Null
+Write-Host "      OK" -ForegroundColor Green
+
+# ── PULL GROUPS ───────────────────────────────────────────────────────────────
+Write-Host "[3/5] Pulling security groups and members..." -ForegroundColor Cyan
+
+$allGroups = Get-MgGroup -Filter "securityEnabled eq true" -All `
+             -Property "DisplayName,Id,Description" |
+             Where-Object {
+                 $n = $_.DisplayName
+                 $match = $false
+                 foreach ($p in $GroupPrefixes) {
+                     if ($n -like "$p*") { $match = $true }
+                 }
+                 $match
+             }
+
+Write-Host "      Found $($allGroups.Count) groups" -ForegroundColor Green
+
+$roleAssignments = Get-AzRoleAssignment |
+                   Where-Object { $_.ObjectType -eq "Group" } |
+                   Select-Object DisplayName, RoleDefinitionName, Scope
+
+$groupsData = New-Object System.Collections.ArrayList
+
+foreach ($g in $allGroups) {
+    Write-Host "      Processing: $($g.DisplayName)" -ForegroundColor Gray
+
+    # Find role assignment for this group
+    $role = $roleAssignments | Where-Object { $_.DisplayName -eq $g.DisplayName } | Select-Object -First 1
+    if ($role) {
+        $roleName  = $role.RoleDefinitionName
+        $roleScope = $role.Scope
+    } else {
+        $roleName  = "No direct assignment"
+        $roleScope = ""
+    }
+
+    # Get group description safely
+    $groupDesc = Coalesce $g.Description ""
+
+    # Get members
+    $rawMembers = Get-MgGroupMember -GroupId $g.Id -All -ErrorAction SilentlyContinue
+    $membersList = New-Object System.Collections.ArrayList
+
+    foreach ($m in $rawMembers) {
+        $user = Get-MgUser -UserId $m.Id -Property "UserPrincipalName,DisplayName" -ErrorAction SilentlyContinue
+        if ($user) {
+            # PS 5.1 safe: get added date without ??
+            $addedDate = "Unknown"
+            if ($m.AdditionalProperties -and $m.AdditionalProperties.ContainsKey("createdDateTime")) {
+                $addedDate = $m.AdditionalProperties["createdDateTime"]
+            }
+            $memberObj = @{
+                upn   = $user.UserPrincipalName
+                name  = $user.DisplayName
+                type  = "User"
+                added = $addedDate
+            }
+            [void]$membersList.Add($memberObj)
+        } else {
+            $sp = Get-MgServicePrincipal -ServicePrincipalId $m.Id -ErrorAction SilentlyContinue
+            if ($sp) {
+                $memberObj = @{
+                    upn   = Coalesce $sp.AppId $sp.DisplayName
+                    name  = $sp.DisplayName
+                    type  = "Service Principal"
+                    added = "Unknown"
+                }
+                [void]$membersList.Add($memberObj)
+            }
+        }
+    }
+
+    $groupObj = @{
+        name    = $g.DisplayName
+        desc    = $groupDesc
+        role    = $roleName
+        scope   = $roleScope
+        sub     = $SubName
+        members = $membersList.ToArray()
+    }
+    [void]$groupsData.Add($groupObj)
+}
+
+# ── PULL PIM DATA ─────────────────────────────────────────────────────────────
+Write-Host "[4/5] Pulling PIM data..." -ForegroundColor Cyan
+
+# Helper functions — PS 5.1 compatible
+function Resolve-Principal($id) {
+    $u = Get-MgUser -UserId $id -ErrorAction SilentlyContinue
+    if ($u) { return $u.UserPrincipalName }
+    $sp = Get-MgServicePrincipal -ServicePrincipalId $id -ErrorAction SilentlyContinue
+    if ($sp) { return $sp.DisplayName }
+    return $id
+}
+
+function Resolve-Role($id) {
+    $r = Get-MgRoleManagementDirectoryRoleDefinition -UnifiedRoleDefinitionId $id -ErrorAction SilentlyContinue
+    if ($r) { return $r.DisplayName } else { return $id }
+}
+
+function Get-Tier($roleName) {
+    if ($roleName -match "Owner|Global Admin|Privileged") { return "Critical" }
+    if ($roleName -match "Contributor|User Access")       { return "High" }
+    if ($roleName -match "Reader|Monitor")                { return "Low" }
+    return "Medium"
+}
+
+# Active PIM assignments
+$pimActiveData = New-Object System.Collections.ArrayList
+try {
+    $active = Get-MgRoleManagementDirectoryRoleAssignmentScheduleInstance -All -ErrorAction Stop |
+              Where-Object { $_.AssignmentType -eq "Activated" }
+    foreach ($a in $active) {
+        $startStr = if ($a.StartDateTime) { $a.StartDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ") } else { "" }
+        $endStr   = if ($a.EndDateTime)   { $a.EndDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ") }   else { "" }
+        $dur      = "Unknown"
+        if ($a.StartDateTime -and $a.EndDateTime) {
+            $dur = "$([Math]::Round(($a.EndDateTime - $a.StartDateTime).TotalHours, 1))h"
+        }
+        $pimObj = @{
+            principal   = Resolve-Principal $a.PrincipalId
+            role        = Resolve-Role $a.RoleDefinitionId
+            scope       = Coalesce $a.DirectoryScopeId "/"
+            activatedAt = $startStr
+            expiresAt   = $endStr
+            duration    = $dur
+        }
+        [void]$pimActiveData.Add($pimObj)
+    }
+} catch {
+    Write-Host "      PIM active assignments: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# Eligible (JIT) assignments
+$pimEligData = New-Object System.Collections.ArrayList
+try {
+    $elig = Get-MgRoleManagementDirectoryRoleEligibilitySchedule -All -ErrorAction Stop
+    foreach ($e in $elig) {
+        $rName = Resolve-Role $e.RoleDefinitionId
+        $maxDur = "Not set"
+        if ($e.ScheduleInfo -and $e.ScheduleInfo.Expiration -and $e.ScheduleInfo.Expiration.Duration) {
+            $maxDur = $e.ScheduleInfo.Expiration.Duration
+        }
+        $pimObj = @{
+            principal   = Resolve-Principal $e.PrincipalId
+            role        = $rName
+            tier        = Get-Tier $rName
+            maxDuration = $maxDur
+            approval    = "Check PIM policy"
+            mfa         = "Check PIM policy"
+        }
+        [void]$pimEligData.Add($pimObj)
+    }
+} catch {
+    Write-Host "      PIM eligible: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# PIM activation history — last 30 days
+$pimHistData = New-Object System.Collections.ArrayList
+try {
+    $since  = (Get-Date).AddDays(-30).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $audits = Get-MgAuditLogDirectoryAudit -All -ErrorAction Stop |
+              Where-Object { $_.LoggedByService -eq "PIM" -and $_.ActivityDateTime -ge [datetime]$since }
+    foreach ($a in $audits) {
+        # Safely extract fields
+        $principal = "Unknown"
+        if ($a.InitiatedBy.User -and $a.InitiatedBy.User.UserPrincipalName) {
+            $principal = $a.InitiatedBy.User.UserPrincipalName
+        } elseif ($a.InitiatedBy.App -and $a.InitiatedBy.App.DisplayName) {
+            $principal = $a.InitiatedBy.App.DisplayName
+        }
+
+        $role = "Unknown"
+        $roleTarget = $a.TargetResources | Where-Object { $_.Type -eq "Role" } | Select-Object -First 1
+        if ($roleTarget) { $role = $roleTarget.DisplayName }
+
+        $just = ""
+        $approver = "N/A"
+        if ($a.AdditionalDetails) {
+            $justEntry     = $a.AdditionalDetails | Where-Object { $_.Key -eq "justification" } | Select-Object -First 1
+            $approverEntry = $a.AdditionalDetails | Where-Object { $_.Key -eq "approver" }      | Select-Object -First 1
+            if ($justEntry)     { $just     = $justEntry.Value }
+            if ($approverEntry) { $approver = $approverEntry.Value }
+        }
+
+        $histObj = @{
+            date          = $a.ActivityDateTime.ToString("yyyy-MM-dd HH:mm")
+            principal     = $principal
+            role          = $role
+            justification = $just
+            approvedBy    = $approver
+            result        = $a.Result
+        }
+        [void]$pimHistData.Add($histObj)
+    }
+} catch {
+    Write-Host "      PIM history: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+Write-Host "      PIM active=$($pimActiveData.Count) eligible=$($pimEligData.Count) history=$($pimHistData.Count)" -ForegroundColor Green
+
+# ── CONVERT TO JSON ───────────────────────────────────────────────────────────
+$groupsJson  = $groupsData.ToArray()  | ConvertTo-Json -Depth 6 -Compress
+$pimActJson  = $pimActiveData.ToArray()| ConvertTo-Json -Depth 4 -Compress
+$pimEligJson = $pimEligData.ToArray() | ConvertTo-Json -Depth 4 -Compress
+$pimHistJson = $pimHistData.ToArray() | ConvertTo-Json -Depth 4 -Compress
+
+# Handle empty arrays — ConvertTo-Json returns "null" for empty, fix to "[]"
+if ($groupsJson  -eq "null") { $groupsJson  = "[]" }
+if ($pimActJson  -eq "null") { $pimActJson  = "[]" }
+if ($pimEligJson -eq "null") { $pimEligJson = "[]" }
+if ($pimHistJson -eq "null") { $pimHistJson = "[]" }
+
+$totalMembers   = 0
+foreach ($g in $groupsData) { $totalMembers += $g.members.Count }
+$pimActiveCnt   = $pimActiveData.Count
+$pimEligCnt     = $pimEligData.Count
+$pimHistCnt     = $pimHistData.Count
+$pimFailCnt     = ($pimHistData | Where-Object { $_.result -eq "failure" }).Count
+$pimCritCnt     = ($pimEligData | Where-Object { $_.tier   -eq "Critical" }).Count
+$groupCount     = $groupsData.Count
+$SubNameShort   = $SubName.Split(" ")[0]
+
+# ── BUILD HTML ROWS ───────────────────────────────────────────────────────────
+function TierBadge($t) {
+    $cls = switch ($t) { "Critical"{"b-crit"} "High"{"b-high"} "Low"{"b-low"} default{"b-med"} }
+    "<span class='badge $cls'>$t</span>"
+}
+
+$pimActiveRows = ""
+if ($pimActiveData.Count -eq 0) {
+    $pimActiveRows = "<tr><td colspan='6' style='text-align:center;color:#888;padding:16px'>No active PIM assignments at time of report</td></tr>"
+} else {
+    foreach ($r in $pimActiveData) {
+        $pimActiveRows += "<tr><td>$($r.principal)</td><td>$($r.role)</td>" +
+            "<td style='font-size:10px;color:#888'>$($r.scope)</td>" +
+            "<td>$($r.activatedAt)</td><td>$($r.expiresAt)</td>" +
+            "<td><span class='badge b-act'>$($r.duration)</span></td></tr>"
+    }
+}
+
+$pimEligRows = ""
+foreach ($r in $pimEligData) {
+    $pimEligRows += "<tr><td>$($r.principal)</td><td>$($r.role)</td><td>$(TierBadge $r.tier)</td>" +
+        "<td>$($r.maxDuration)</td><td>$($r.approval)</td><td>$($r.mfa)</td></tr>"
+}
+
+$pimHistRows = ""
+foreach ($r in $pimHistData) {
+    $rowCls = if ($r.result -eq "failure") { "hist-row-fail" } else { "hist-row-ok" }
+    $just   = if ($r.justification) { $r.justification } else { "<span style='color:#b71c1c'>No justification recorded</span>" }
+    $resBadge = if ($r.result -eq "success") { "<span class='badge b-done'>Success</span>" } else { "<span class='badge b-act'>Failed</span>" }
+    $pimHistRows += "<tr class='$rowCls' data-result='$($r.result)'>" +
+        "<td>$($r.date)</td><td>$($r.principal)</td><td>$($r.role)</td>" +
+        "<td style='font-size:11px'>$just</td>" +
+        "<td style='font-size:11px'>$($r.approvedBy)</td><td>$resBadge</td></tr>"
+}
+
+# ── WRITE HTML ────────────────────────────────────────────────────────────────
+Write-Host "[5/5] Writing HTML report..." -ForegroundColor Cyan
+
+$html = @"
+<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>RBAC Access Review $ReviewDate</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Arial,sans-serif;font-size:13px;color:#1a1a1a;background:#f4f5f7;padding:0}
+.page-header{background:#1F3864;color:#fff;padding:16px 28px;display:flex;justify-content:space-between;align-items:center}
+.page-header h1{font-size:16px;font-weight:700}
+.page-header .meta{font-size:11px;color:#aac4e8;text-align:right;line-height:1.8}
+.tabs{display:flex;gap:2px;background:#162d52;padding:0 28px}
+.tab{padding:10px 20px;font-size:12px;font-weight:600;cursor:pointer;color:#aac4e8;border-bottom:3px solid transparent}
+.tab.active{color:#fff;border-bottom:3px solid #4fc3f7}
+.tab-body{display:none;padding:20px 28px}.tab-body.active{display:block}
+.summary{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:18px}
+.stat{background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:11px 14px;text-align:center}
+.stat-num{font-size:20px;font-weight:700;color:#1F3864}
+.stat-lbl{font-size:10px;color:#888;margin-top:2px}
+.toolbar{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center}
+.toolbar input,.toolbar select{padding:6px 10px;border:1px solid #ccc;border-radius:6px;font-size:12px}
+.toolbar input{width:230px}
+.toolbar button{padding:6px 13px;border:1px solid #ccc;border-radius:6px;font-size:12px;background:#fff;cursor:pointer}
+.toolbar button:hover{background:#f0f0f0}
+.btn-export{background:#1F3864!important;color:#fff!important;border-color:#1F3864!important}
+.count{font-size:11px;color:#888;margin-bottom:8px}
+.group{background:#fff;border:1px solid #e0e0e0;border-radius:8px;margin-bottom:7px;overflow:hidden}
+.ghdr{display:flex;align-items:center;gap:7px;padding:9px 14px;cursor:pointer;user-select:none}
+.ghdr:hover{background:#f9f9f9}
+.chev{font-size:10px;color:#999;transition:transform .15s;width:14px;display:inline-block}
+.chev.open{transform:rotate(90deg)}
+.gname{font-weight:700;font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge{font-size:10px;padding:2px 7px;border-radius:10px;white-space:nowrap;font-weight:600}
+.b-sub{background:#e0f2f1;color:#00695c}.b-role{background:#e8eaf6;color:#3949ab}
+.b-count{background:#f3e5f5;color:#6a1b9a}.b-pend{background:#fff8e1;color:#e65100}
+.b-done{background:#e8f5e9;color:#2e7d32}.b-act{background:#fce4e4;color:#b71c1c}
+.b-crit{background:#fce4e4;color:#b71c1c}.b-high{background:#fff3e0;color:#e65100}
+.b-med{background:#e8eaf6;color:#3949ab}.b-low{background:#e8f5e9;color:#2e7d32}
+.desc{font-size:11px;color:#777;padding:4px 14px 5px 36px;border-top:1px dashed #eee;background:#fafafa}
+.panel{display:none}.panel.open{display:block}
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead th{background:#1F3864;color:#fff;padding:7px 12px;text-align:left;font-size:11px;font-weight:600}
+tbody td{padding:6px 12px;border-bottom:1px solid #f0f0f0;vertical-align:middle}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:#fafafa}
+.dec-wrap{display:flex;gap:4px}
+.dbtn{font-size:10px;padding:3px 10px;border-radius:12px;border:1px solid #ccc;cursor:pointer;background:#fff;color:#555;font-weight:700;transition:all .15s}
+.dk{background:#e8f5e9;color:#2e7d32;border-color:#a5d6a7}
+.dr{background:#fce4e4;color:#b71c1c;border-color:#ef9a9a}
+tr.rk td{background:#f1f8f1}tr.rr td{background:#fff5f5}
+.footer-row{background:#f9f9f9;padding:7px 14px;border-top:1px solid #eee;display:flex;justify-content:space-between;font-size:11px;color:#666}
+.prog{height:4px;background:#e0e0e0;margin:0 14px 10px}
+.prog-fill{height:4px;background:#2e7d32;transition:width .3s}
+.pim-section{margin-bottom:20px}
+.pim-section h3{font-size:13px;font-weight:700;margin-bottom:10px;color:#1F3864;padding-bottom:5px;border-bottom:2px solid #e0e0e0}
+.pim-table-wrap{background:#fff;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden;margin-bottom:16px}
+.hist-row-fail td{background:#fff5f5}.hist-row-ok td{background:#f1f8f1}
+.sign-off-box{background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:16px 20px;margin-top:4px}
+.sign-off-box h3{font-size:13px;font-weight:700;color:#1F3864;margin-bottom:12px}
+.sign-off-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.sign-off-field{display:flex;flex-direction:column;gap:4px}
+.sign-off-field label{font-size:11px;color:#666;font-weight:600}
+.sign-off-field input{padding:7px 10px;border:1px solid #ccc;border-radius:6px;font-size:12px}
+.sign-off-field textarea{padding:7px 10px;border:1px solid #ccc;border-radius:6px;font-size:12px;height:70px;resize:vertical}
+.sign-btn{margin-top:14px;padding:8px 20px;background:#1F3864;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:700;cursor:pointer;margin-right:8px}
+.sign-btn:hover{opacity:.9}
+.signed-stamp{display:none;margin-top:10px;background:#e8f5e9;border:1px solid #a5d6a7;border-radius:6px;padding:10px 14px;font-size:12px;color:#2e7d32;font-weight:600}
+.status-bar{background:#fff;border-bottom:1px solid #e0e0e0;padding:8px 28px;display:flex;gap:20px;align-items:center;font-size:12px}
+.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px}
+</style></head><body>
+
+<div class='page-header'>
+  <div>
+    <h1>Azure RBAC Access Review</h1>
+    <div style='font-size:11px;color:#aac4e8;margin-top:3px'>ISO 27001 &nbsp;|&nbsp; A.5.18 Access rights &nbsp;|&nbsp; A.8.2 Privileged access</div>
+  </div>
+  <div class='meta'>
+    Date: <strong style='color:#fff'>$ReviewDate</strong><br>
+    Reviewer: <strong style='color:#fff'>$ReviewedBy</strong><br>
+    Subscription: <strong style='color:#fff'>$SubName</strong>
+  </div>
+</div>
+
+<div class='status-bar'>
+  <span><span class='status-dot' style='background:#2e7d32'></span>Groups reviewed: <strong id='sb-done'>0</strong> of <strong>$groupCount</strong></span>
+  <span><span class='status-dot' style='background:#b71c1c'></span>Flagged for removal: <strong id='sb-remove'>0</strong></span>
+  <span><span class='status-dot' style='background:#e65100'></span>PIM active now: <strong>$pimActiveCnt</strong></span>
+  <span style='flex:1'></span>
+  <span id='overall-status' style='font-weight:700;color:#e65100'>In progress</span>
+</div>
+
+<div class='tabs'>
+  <div class='tab active' onclick='showTab("groups",this)'>Group membership review</div>
+  <div class='tab' onclick='showTab("pim",this)'>PIM — privileged access</div>
+  <div class='tab' onclick='showTab("signoff",this)'>Sign-off and export</div>
+</div>
+
+<div id='tab-groups' class='tab-body active'>
+  <div class='summary'>
+    <div class='stat'><div class='stat-num'>$groupCount</div><div class='stat-lbl'>Groups</div></div>
+    <div class='stat'><div class='stat-num'>$totalMembers</div><div class='stat-lbl'>Total members</div></div>
+    <div class='stat'><div class='stat-num' id='s-remove' style='color:#b71c1c'>0</div><div class='stat-lbl'>Flagged removal</div></div>
+    <div class='stat'><div class='stat-num' id='s-pct' style='color:#2e7d32'>0%</div><div class='stat-lbl'>Complete</div></div>
+    <div class='stat'><div class='stat-num'>$SubNameShort</div><div class='stat-lbl'>Subscription</div></div>
+  </div>
+  <div class='toolbar'>
+    <input type='text' id='search' placeholder='Search group name...' oninput='render()'>
+    <select id='f-role' onchange='render()'><option value=''>All roles</option></select>
+    <select id='f-status' onchange='render()'>
+      <option value=''>All statuses</option>
+      <option value='pending'>Pending</option>
+      <option value='done'>Reviewed</option>
+      <option value='action'>Has removals</option>
+    </select>
+    <button onclick='expandAll()'>Expand all</button>
+    <button onclick='collapseAll()'>Collapse all</button>
+  </div>
+  <div class='count' id='cnt'></div>
+  <div id='list'></div>
+</div>
+
+<div id='tab-pim' class='tab-body'>
+  <div class='summary'>
+    <div class='stat'><div class='stat-num' style='color:#b71c1c'>$pimActiveCnt</div><div class='stat-lbl'>Active now</div></div>
+    <div class='stat'><div class='stat-num' style='color:#3949ab'>$pimEligCnt</div><div class='stat-lbl'>Eligible (JIT)</div></div>
+    <div class='stat'><div class='stat-num'>$pimHistCnt</div><div class='stat-lbl'>Activations (30d)</div></div>
+    <div class='stat'><div class='stat-num' style='color:#b71c1c'>$pimFailCnt</div><div class='stat-lbl'>Failed activations</div></div>
+    <div class='stat'><div class='stat-num'>$pimCritCnt</div><div class='stat-lbl'>Critical eligible</div></div>
+  </div>
+  <div class='pim-section'>
+    <h3>Currently active PIM assignments</h3>
+    <div class='pim-table-wrap'><table>
+      <thead><tr><th>Principal</th><th>Role</th><th>Scope</th><th>Activated at</th><th>Expires at</th><th>Duration</th></tr></thead>
+      <tbody>$pimActiveRows</tbody>
+    </table></div>
+  </div>
+  <div class='pim-section'>
+    <h3>Eligible assignments — who can activate JIT access</h3>
+    <div class='pim-table-wrap'><table>
+      <thead><tr><th>Principal</th><th>Role</th><th>Tier</th><th>Max duration</th><th>Requires approval</th><th>MFA required</th></tr></thead>
+      <tbody>$pimEligRows</tbody>
+    </table></div>
+  </div>
+  <div class='pim-section'>
+    <h3>Activation history — last 30 days</h3>
+    <div class='toolbar'>
+      <input type='text' id='pim-search' placeholder='Search user or role...' oninput='filterPim()'>
+      <select id='pim-result' onchange='filterPim()'>
+        <option value=''>All results</option>
+        <option value='success'>Success</option>
+        <option value='failure'>Failed</option>
+      </select>
+    </div>
+    <div class='pim-table-wrap'><table>
+      <thead><tr><th>Date / time</th><th>Principal</th><th>Role activated</th><th>Justification</th><th>Approved by</th><th>Result</th></tr></thead>
+      <tbody id='pim-hist-body'>$pimHistRows</tbody>
+    </table></div>
+  </div>
+</div>
+
+<div id='tab-signoff' class='tab-body'>
+  <div class='sign-off-box'>
+    <h3>Reviewer sign-off</h3>
+    <div class='sign-off-grid'>
+      <div class='sign-off-field'><label>Reviewer name</label><input type='text' id='so-name' value='$ReviewedBy'></div>
+      <div class='sign-off-field'><label>Review date</label><input type='text' id='so-date' value='$ReviewDate'></div>
+      <div class='sign-off-field'><label>Subscription reviewed</label><input type='text' value='$SubName' readonly></div>
+      <div class='sign-off-field'><label>ISO control</label><input type='text' value='A.5.18 Access rights / A.8.2 Privileged access' readonly></div>
+      <div class='sign-off-field' style='grid-column:1/-1'><label>Notes / exceptions</label>
+        <textarea id='so-notes' placeholder='Document any exceptions or follow-up actions...'></textarea>
+      </div>
+    </div>
+    <div>
+      <button class='sign-btn' onclick='exportCSV()'>Export audit CSV</button>
+      <button class='sign-btn' style='background:#2e7d32' onclick='window.print()'>Print / save as PDF</button>
+      <button class='sign-btn' style='background:#6a1b9a' onclick='signOff()'>Sign off review</button>
+    </div>
+    <div class='signed-stamp' id='signed-stamp'></div>
+  </div>
+  <div style='margin-top:16px;background:#fff;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden'>
+    <table><thead><tr><th>Group</th><th>Member</th><th>Type</th><th>Decision</th><th>Role</th></tr></thead>
+    <tbody id='summary-body'></tbody></table>
+  </div>
+</div>
+
+<script>
+var GROUPS   = $groupsJson;
+var PIM_HIST = $pimHistJson;
+var META     = { date:"$ReviewDate", reviewer:"$ReviewedBy", sub:"$SubName" };
+var dec = {};
+var exp = {};
+
+function showTab(id, el) {
+  document.querySelectorAll('.tab-body').forEach(function(t){ t.classList.remove('active'); });
+  document.querySelectorAll('.tab').forEach(function(t){ t.classList.remove('active'); });
+  document.getElementById('tab-'+id).classList.add('active');
+  el.classList.add('active');
+  if (id === 'signoff') buildSummary();
+}
+function gd(id,i){ return dec[id+'_'+i] || ''; }
+function sd(id,i,v){
+  var k = id+'_'+i;
+  dec[k] = (dec[k] === v) ? '' : v;
+  sync(); render(); exp[id] = true; render();
+}
+function gStatus(g){
+  var ds = g.members.map(function(_,i){ return gd(g.name,i); });
+  if (ds.every(function(d){ return d===''; })) return 'pending';
+  if (ds.some(function(d){ return d==='remove'; })) return 'action';
+  if (ds.every(function(d){ return d!==''; })) return 'done';
+  return 'pending';
+}
+function sync(){
+  var rem=0, decided=0, grpDone=0;
+  GROUPS.forEach(function(g){
+    g.members.forEach(function(_,i){ if(gd(g.name,i)==='remove') rem++; if(gd(g.name,i)!=='') decided++; });
+    if(g.members.every(function(_,i){ return gd(g.name,i)!==''; })) grpDone++;
+  });
+  var total = GROUPS.reduce(function(a,g){ return a+g.members.length; }, 0);
+  document.getElementById('s-remove').textContent = rem;
+  document.getElementById('sb-remove').textContent = rem;
+  document.getElementById('sb-done').textContent = grpDone;
+  document.getElementById('s-pct').textContent = Math.round(decided/Math.max(total,1)*100)+'%';
+  var allDone = GROUPS.every(function(g){ return g.members.every(function(_,i){ return gd(g.name,i)!==''; }); });
+  var os = document.getElementById('overall-status');
+  os.textContent = allDone ? 'Complete — ready for sign-off' : 'In progress';
+  os.style.color = allDone ? '#2e7d32' : '#e65100';
+}
+function render(){
+  var q  = document.getElementById('search').value.toLowerCase();
+  var fr = document.getElementById('f-role').value;
+  var fs = document.getElementById('f-status').value;
+  var filtered = GROUPS.filter(function(g){
+    return (!q || g.name.toLowerCase().indexOf(q) > -1) &&
+           (!fr || g.role === fr) &&
+           (!fs || gStatus(g) === fs);
+  });
+  document.getElementById('cnt').textContent = 'Showing '+filtered.length+' of '+GROUPS.length+' groups';
+  var html = '';
+  filtered.forEach(function(g){
+    var open = exp[g.name] ? 'open' : '';
+    var st = gStatus(g);
+    var sbadge = st==='done' ? "<span class='badge b-done'>Reviewed</span>" :
+                 st==='action' ? "<span class='badge b-act'>Action required</span>" :
+                 "<span class='badge b-pend'>Pending</span>";
+    var ds = g.members.map(function(_,i){ return gd(g.name,i); });
+    var done = ds.filter(function(d){ return d!==''; }).length;
+    var pct  = g.members.length ? Math.round(done/g.members.length*100) : 0;
+    var rem  = ds.filter(function(d){ return d==='remove'; }).length;
+    var rows = '';
+    g.members.forEach(function(m,i){
+      var d = gd(g.name,i);
+      var rc = d==='keep'?'rk':d==='remove'?'rr':'';
+      var gn = g.name.replace(/'/g,"\\'");
+      rows += "<tr class='"+rc+"'><td>"+m.upn+"</td><td>"+m.name+"</td><td>"+m.type+"</td><td>"+m.added+"</td>"+
+        "<td><div class='dec-wrap'>"+
+        "<button class='dbtn "+(d==='keep'?'dk':'')+"' onclick=\"sd('"+gn+"',"+i+",'keep')\">Keep</button>"+
+        "<button class='dbtn "+(d==='remove'?'dr':'')+"' onclick=\"sd('"+gn+"',"+i+",'remove')\">Remove</button>"+
+        "</div></td></tr>";
+    });
+    var scopeTxt = g.scope ? " <span style='color:#aaa;font-size:10px'>"+g.scope+"</span>" : "";
+    html += "<div class='group'>"+
+      "<div class='ghdr' onclick='tog(\""+g.name.replace(/"/g,'&quot;')+"\")'>"+
+      "<span class='chev "+open+"'>&#9654;</span>"+
+      "<span class='gname' title='"+g.name+"'>"+g.name+"</span>"+
+      "<span class='badge b-sub'>"+g.sub+"</span>"+
+      (g.role?"<span class='badge b-role'>"+g.role+"</span>":"")+
+      "<span class='badge b-count'>"+g.members.length+" members</span>"+sbadge+"</div>"+
+      "<div class='desc'>"+g.desc+scopeTxt+"</div>"+
+      "<div class='panel "+open+"'>"+
+      "<table><thead><tr><th>UPN</th><th>Display name</th><th>Type</th><th>Date added</th><th>Decision</th></tr></thead>"+
+      "<tbody>"+rows+"</tbody></table>"+
+      "<div class='footer-row'><span>"+done+"/"+g.members.length+" decided"+
+      (rem?" &nbsp;|&nbsp; <strong style='color:#b71c1c'>"+rem+" flagged for removal</strong>":"")+"</span></div>"+
+      "<div class='prog'><div class='prog-fill' style='width:"+pct+"%'></div></div>"+
+      "</div></div>";
+  });
+  document.getElementById('list').innerHTML = html;
+
+  // Populate role filter once
+  var sel = document.getElementById('f-role');
+  if (sel.options.length === 1) {
+    var roles = [];
+    GROUPS.forEach(function(g){ if(g.role && roles.indexOf(g.role)===-1) roles.push(g.role); });
+    roles.sort().forEach(function(r){ var o=document.createElement('option'); o.value=r; o.textContent=r; sel.appendChild(o); });
+  }
+}
+function tog(id){ exp[id] = !exp[id]; render(); }
+function expandAll(){ GROUPS.forEach(function(g){ exp[g.name]=true; }); render(); }
+function collapseAll(){ exp={}; render(); }
+function filterPim(){
+  var q  = document.getElementById('pim-search').value.toLowerCase();
+  var r  = document.getElementById('pim-result').value;
+  document.querySelectorAll('#pim-hist-body tr').forEach(function(tr){
+    var txt = tr.textContent.toLowerCase();
+    var res = tr.getAttribute('data-result') || '';
+    tr.style.display = (!q||txt.indexOf(q)>-1)&&(!r||res===r) ? '' : 'none';
+  });
+}
+function buildSummary(){
+  var rows = '';
+  GROUPS.forEach(function(g){
+    g.members.forEach(function(m,i){
+      var d = gd(g.name,i) || 'pending';
+      var bg = d==='keep'?'#f1f8f1':d==='remove'?'#fff5f5':'';
+      var fc = d==='remove'?'#b71c1c':d==='keep'?'#2e7d32':'#888';
+      rows += "<tr style='background:"+bg+"'><td>"+g.name+"</td><td>"+m.upn+"</td><td>"+m.type+"</td>"+
+        "<td><strong style='color:"+fc+"'>"+d+"</strong></td><td>"+g.role+"</td></tr>";
+    });
+  });
+  document.getElementById('summary-body').innerHTML = rows;
+}
+function exportCSV(){
+  var rows = ['Group,Subscription,Azure Role,Scope,UPN,Display Name,Type,Date Added,Decision,Review Date,Reviewer'];
+  var notes = document.getElementById('so-notes').value.replace(/"/g,'""');
+  GROUPS.forEach(function(g){
+    g.members.forEach(function(m,i){
+      var d = gd(g.name,i) || 'pending';
+      rows.push([g.name,g.sub,g.role,g.scope,m.upn,m.name,m.type,m.added,d,META.date,META.reviewer]
+        .map(function(v){ return '"'+String(v||'').replace(/"/g,'""')+'"'; }).join(','));
+    });
+  });
+  rows.push('','PIM ACTIVATION HISTORY','Date,Principal,Role,Justification,Approved By,Result');
+  PIM_HIST.forEach(function(h){
+    rows.push([h.date,h.principal,h.role,h.justification,h.approvedBy,h.result]
+      .map(function(v){ return '"'+String(v||'').replace(/"/g,'""')+'"'; }).join(','));
+  });
+  var a = document.createElement('a');
+  a.href = 'data:text/csv;charset=utf-8,'+encodeURIComponent(rows.join('\n'));
+  a.download = 'RBAC_Review_'+META.date+'.csv';
+  a.click();
+}
+function signOff(){
+  var name = document.getElementById('so-name').value;
+  var date = document.getElementById('so-date').value;
+  var stamp = document.getElementById('signed-stamp');
+  stamp.style.display = 'block';
+  stamp.textContent = 'Signed off by '+name+' on '+date+' — ready for audit submission.';
+  buildSummary();
+}
+sync(); render();
+</script>
+</body></html>
+"@
+
+$html | Out-File -FilePath $OutputPath -Encoding UTF8
+Write-Host ""
+Write-Host "Done! Report saved to: $OutputPath" -ForegroundColor Green
+Write-Host "Open in Chrome or Edge to conduct your review." -ForegroundColor Cyan
