@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Monthly Security Posture Report</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c232c; --line:#2a313c;
+    --ink:#e6edf3; --muted:#8b98a9; --faint:#5d6b7d;
+    --accent:#38bdf8; --accent2:#0ea5e9;
+    --crit:#f85149; --high:#fb923c; --med:#e3b341; --low:#3fb950; --info:#58a6ff;
+    --ok:#3fb950; --okbg:rgba(63,185,80,.12);
+    --critbg:rgba(248,81,73,.12); --highbg:rgba(251,146,60,.12); --medbg:rgba(227,179,65,.12);
+    --mono:ui-monospace,"Cascadia Code","JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.5;
+    background-image:radial-gradient(circle at 12% -10%,rgba(56,189,248,.08),transparent 40%);min-height:100vh}
+  .wrap{max-width:1240px;margin:0 auto;padding:28px 22px 80px}
+
+  /* Header */
+  header{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;
+    border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:24px;flex-wrap:wrap}
+  .brand{display:flex;flex-direction:column;gap:4px}
+  .brand .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--accent)}
+  .brand h1{font-size:22px;font-weight:650;letter-spacing:-.01em}
+  .meta{text-align:right;font-family:var(--mono);font-size:12px;color:var(--muted);line-height:1.7}
+  .meta b{color:var(--ink);font-weight:600}
+
+  /* KPI cards */
+  .kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:26px}
+  .kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 16px 14px;position:relative;overflow:hidden}
+  .kpi .label{font-family:var(--mono);font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);margin-bottom:8px}
+  .kpi .num{font-size:30px;font-weight:700;font-family:var(--mono);line-height:1}
+  .kpi .sub{font-size:11px;color:var(--muted);margin-top:6px}
+  .kpi.score .num{color:var(--accent)}
+  .kpi .ring{position:absolute;right:12px;top:12px;width:42px;height:42px}
+  .kpi.crit .num{color:var(--crit)} .kpi.high .num{color:var(--high)}
+  .kpi.med .num{color:var(--med)} .kpi.inc .num{color:var(--info)}
+
+  /* Tabs */
+  .tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:22px}
+  .tab{background:none;border:none;color:var(--muted);font-family:var(--sans);font-size:13.5px;font-weight:560;
+    padding:11px 18px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:.15s}
+  .tab:hover{color:var(--ink)}
+  .tab.active{color:var(--ink);border-bottom-color:var(--accent)}
+  .tab .badge{display:inline-block;margin-left:7px;background:var(--critbg);color:var(--crit);
+    font-family:var(--mono);font-size:10px;padding:1px 6px;border-radius:20px;font-weight:600}
+  .panel-view{display:none;animation:fade .25s ease}
+  .panel-view.active{display:block}
+  @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+  /* Controls bar */
+  .controls{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:18px}
+  .field{display:flex;flex-direction:column;gap:5px}
+  .field label{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
+  select,input[type=text]{background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+    border-radius:8px;padding:9px 12px;font-family:var(--sans);font-size:13px;min-width:260px;outline:none}
+  select:focus,input:focus{border-color:var(--accent)}
+  .sub-score{margin-left:auto;display:flex;align-items:center;gap:10px;font-family:var(--mono);font-size:13px;color:var(--muted)}
+  .sub-score b{font-size:20px;color:var(--accent)}
+
+  /* Tables */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-bottom:20px}
+  .card-h{padding:14px 18px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+  .card-h h3{font-size:14px;font-weight:620}
+  .card-h .count{font-family:var(--mono);font-size:12px;color:var(--muted)}
+  table{width:100%;border-collapse:collapse}
+  th{text-align:left;font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--faint);font-weight:600;padding:11px 18px;border-bottom:1px solid var(--line);background:var(--panel2)}
+  td{padding:12px 18px;border-bottom:1px solid var(--line);vertical-align:top;font-size:13px}
+  tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:rgba(56,189,248,.04)}
+  .res{font-family:var(--mono);font-size:12px;color:var(--ink)}
+  .restype{font-family:var(--mono);font-size:11px;color:var(--faint);display:block;margin-top:2px}
+  .pill{display:inline-block;font-family:var(--mono);font-size:10.5px;font-weight:600;padding:2px 9px;border-radius:6px;letter-spacing:.03em}
+  .sev-Critical,.sev-High.crit{background:var(--critbg);color:var(--crit)}
+  .sev-High{background:var(--highbg);color:var(--high)}
+  .sev-Medium{background:var(--medbg);color:var(--med)}
+  .sev-Low{background:var(--okbg);color:var(--low)}
+  .empty{padding:40px;text-align:center;color:var(--faint);font-family:var(--mono);font-size:13px}
+
+  /* Baseline */
+  .baseline-grid td:first-child{font-weight:600}
+  .target{font-family:var(--mono);font-size:12px;color:var(--low)}
+  .note{color:var(--muted);font-size:12.5px}
+
+  /* Sign-off */
+  .signoff{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:22px;margin-top:8px}
+  .signoff h3{font-size:14px;margin-bottom:4px}
+  .signoff .hint{color:var(--muted);font-size:12.5px;margin-bottom:18px}
+  .signoff-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px 24px}
+  .so-field{display:flex;flex-direction:column;gap:6px}
+  .so-field label{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
+  .decision{display:flex;gap:10px;margin-top:4px}
+  .decision label{display:flex;align-items:center;gap:7px;background:var(--panel2);border:1px solid var(--line);
+    padding:9px 14px;border-radius:8px;cursor:pointer;font-size:13px;font-family:var(--mono)}
+  .decision input{accent-color:var(--accent)}
+  .sign-row{display:flex;justify-content:space-between;align-items:center;margin-top:22px;padding-top:18px;border-top:1px solid var(--line)}
+  .btn{background:var(--accent);color:#04141f;border:none;border-radius:8px;padding:10px 20px;
+    font-family:var(--sans);font-weight:650;font-size:13px;cursor:pointer}
+  .btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+  .stamp{font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+
+  footer{margin-top:36px;padding-top:18px;border-top:1px solid var(--line);
+    font-family:var(--mono);font-size:11px;color:var(--faint);display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
+  @media(max-width:880px){.kpis{grid-template-columns:repeat(2,1fr)}.signoff-grid{grid-template-columns:1fr}.sub-score{margin-left:0;width:100%}}
+  @media print{body{background:#fff;color:#000}.tab,.btn{display:none}.panel-view{display:block!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="brand">
+      <span class="eyebrow">Cloud Security Operations</span>
+      <h1 id="title">Monthly Security Posture Report</h1>
+    </div>
+    <div class="meta" id="meta"></div>
+  </header>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="tabs">
+    <button class="tab active" data-view="baseline">Baseline</button>
+    <button class="tab" data-view="risks">Current Risks <span class="badge" id="riskBadge"></span></button>
+    <button class="tab" data-view="signoff">Risk Sign-off</button>
+  </div>
+
+  <!-- BASELINE -->
+  <section class="panel-view active" id="view-baseline">
+    <p class="note" style="margin-bottom:16px">The target state every subscription is measured against. Deviations appear under <b>Current Risks</b>.</p>
+    <div class="card">
+      <div class="card-h"><h3>Security Baseline &mdash; Target State</h3><span class="count" id="baseCount"></span></div>
+      <table class="baseline-grid">
+        <thead><tr><th>Control / Domain</th><th>Target</th><th>Rationale</th></tr></thead>
+        <tbody id="baseBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- RISKS -->
+  <section class="panel-view" id="view-risks">
+    <div class="controls">
+      <div class="field">
+        <label for="subSelect">Subscription</label>
+        <select id="subSelect" onchange="renderRisks()"></select>
+      </div>
+      <div class="field">
+        <label for="sevFilter">Min. severity</label>
+        <select id="sevFilter" onchange="renderRisks()">
+          <option value="0">All</option>
+          <option value="2">Medium+</option>
+          <option value="3">High+</option>
+          <option value="4">Critical only</option>
+        </select>
+      </div>
+      <div class="sub-score" id="subScore"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><h3>Resources with open findings</h3><span class="count" id="issueCount"></span></div>
+      <table>
+        <thead><tr><th>Resource</th><th>Recommendation</th><th>Control</th><th>Severity</th><th>Status</th></tr></thead>
+        <tbody id="issueBody"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><h3>Open Sentinel incidents</h3><span class="count" id="incCount"></span></div>
+      <table>
+        <thead><tr><th>#</th><th>Title</th><th>Severity</th><th>Status</th><th>Created</th></tr></thead>
+        <tbody id="incBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- SIGN-OFF -->
+  <section class="panel-view" id="view-signoff">
+    <div class="card" style="margin-bottom:18px">
+      <div class="card-h"><h3>Risks accepted / for remediation this period</h3><span class="count" id="soCount"></span></div>
+      <table>
+        <thead><tr><th>Subscription</th><th>Top risk</th><th>Severity</th><th>Decision</th></tr></thead>
+        <tbody id="soBody"></tbody>
+      </table>
+    </div>
+
+    <div class="signoff">
+      <h3>Review &amp; sign-off</h3>
+      <p class="hint">Completed monthly as evidence for ISO 27001 (A.5.36 / A.8.8) and SOC 2 monitoring controls.</p>
+      <div class="signoff-grid">
+        <div class="so-field"><label>Reviewer name</label><input type="text" id="soName" placeholder="e.g. Ray ..."></div>
+        <div class="so-field"><label>Role</label><input type="text" id="soRole" placeholder="DevSecOps / Cloud Ops"></div>
+        <div class="so-field"><label>Review date</label><input type="text" id="soDate"></div>
+        <div class="so-field"><label>Next review due</label><input type="text" id="soNext"></div>
+      </div>
+      <div class="so-field" style="margin-top:18px">
+        <label>Period decision</label>
+        <div class="decision">
+          <label><input type="radio" name="dec" checked> Posture acceptable</label>
+          <label><input type="radio" name="dec"> Remediation required</label>
+          <label><input type="radio" name="dec"> Escalate</label>
+        </div>
+      </div>
+      <div class="so-field" style="margin-top:18px">
+        <label>Notes</label>
+        <input type="text" id="soNotes" placeholder="Summary of accepted risks, owners, target dates...">
+      </div>
+      <div class="sign-row">
+        <span class="stamp" id="soStamp">Not yet signed</span>
+        <div style="display:flex;gap:10px">
+          <button class="btn ghost" onclick="window.print()">Export / Print</button>
+          <button class="btn" onclick="signOff()">Sign &amp; lock</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>Generated by SecurityPosture.ps1 &middot; standalone &middot; no external calls</span>
+    <span id="genstamp"></span>
+  </footer>
+</div>
+
+<script>
+/* ===========================================================
+   REPORT DATA
+   The PowerShell script replaces the object below with live data.
+   Marker line is required — do not remove the comment markers.
+   =========================================================== */
+const REPORT_DATA = /*__REPORT_DATA_START__*/ {
+  "meta": {
+    "org": "Contoso Cloud Operations",
+    "period": "May 2026",
+    "generated": "2026-05-31 06:00 SAST",
+    "tenant": "contoso.onmicrosoft.com"
+  },
+  "overall": { "scorePct": 68, "current": 41, "max": 60, "critical": 3, "high": 11, "medium": 24, "openIncidents": 5 },
+  "baseline": [
+    { "control": "MFA on all privileged accounts", "target": "100%", "rationale": "Entra ID / PIM — eligible-only admin roles, MFA enforced." },
+    { "control": "Defender for Cloud plans enabled", "target": "All workload plans ON", "rationale": "Servers, Storage, Containers, Key Vault, SQL." },
+    { "control": "Disk encryption (CMK/PMK)", "target": "100% of VMs & disks", "rationale": "Encryption at rest baseline." },
+    { "control": "Public network exposure", "target": "0 mgmt ports open to Internet", "rationale": "No 22/3389 from Any; use Bastion / JIT." },
+    { "control": "Secure Score", "target": "&ge; 80%", "rationale": "Defender for Cloud overall target." },
+    { "control": "Critical CVEs (vuln assessment)", "target": "0 unremediated > 14 days", "rationale": "MDVM / Qualys integration SLA." },
+    { "control": "Diagnostic logs to Log Analytics", "target": "100% of resources", "rationale": "Sentinel ingestion + audit evidence." }
+  ],
+  "subscriptions": [
+    {
+      "id": "00000000-1111-2222-3333-prod00000001", "name": "PROD-Platform",
+      "scorePct": 61, "current": 37, "max": 60,
+      "issues": [
+        { "resource": "vm-app-prod-01", "type": "microsoft.compute/virtualmachines", "rec": "Management ports of VMs should be protected with JIT", "control": "Secure management ports", "sevName": "Critical", "sev": 4, "status": "Unhealthy" },
+        { "resource": "stproddata001", "type": "microsoft.storage/storageaccounts", "rec": "Storage accounts should restrict network access", "control": "Restrict unauthorized network access", "sevName": "High", "sev": 3, "status": "Unhealthy" },
+        { "resource": "kv-prod-secrets", "type": "microsoft.keyvault/vaults", "rec": "Key Vaults should have soft delete enabled", "control": "Enable encryption at rest", "sevName": "Medium", "sev": 2, "status": "Unhealthy" },
+        { "resource": "vm-app-prod-01", "type": "microsoft.compute/virtualmachines", "rec": "System updates should be installed (Update Manager)", "control": "Apply system updates", "sevName": "High", "sev": 3, "status": "Unhealthy" }
+      ],
+      "incidents": [
+        { "number": "INC-4821", "title": "Suspicious access to blob storage from rare location", "severity": "High", "status": "Active", "created": "2026-05-22" },
+        { "number": "INC-4830", "title": "Multiple failed sign-ins for admin account", "severity": "Medium", "status": "New", "created": "2026-05-27" }
+      ]
+    },
+    {
+      "id": "00000000-1111-2222-3333-nonprod00002", "name": "NONPROD-Sandbox",
+      "scorePct": 74, "current": 44, "max": 60,
+      "issues": [
+        { "resource": "vm-test-04", "type": "microsoft.compute/virtualmachines", "rec": "Endpoint protection should be installed", "control": "Enable endpoint protection", "sevName": "Medium", "sev": 2, "status": "Unhealthy" },
+        { "resource": "sttestlogs02", "type": "microsoft.storage/storageaccounts", "rec": "Secure transfer to storage accounts should be enabled", "control": "Encrypt data in transit", "sevName": "Low", "sev": 1, "status": "Unhealthy" }
+      ],
+      "incidents": [
+        { "number": "INC-4799", "title": "Malware detected on test VM", "severity": "High", "status": "Active", "created": "2026-05-18" }
+      ]
+    },
+    {
+      "id": "00000000-1111-2222-3333-shared0000003", "name": "SHARED-Networking",
+      "scorePct": 82, "current": 49, "max": 60,
+      "issues": [
+        { "resource": "nsg-hub-inbound", "type": "microsoft.network/networksecuritygroups", "rec": "All network ports should be restricted on NSGs", "control": "Restrict unauthorized network access", "sevName": "High", "sev": 3, "status": "Unhealthy" }
+      ],
+      "incidents": []
+    }
+  ]
+} /*__REPORT_DATA_END__*/;
+
+/* ===========================================================
+   RENDERING
+   =========================================================== */
+const SEV_ORDER = { "Critical":4, "High":3, "Medium":2, "Low":1 };
+const D = REPORT_DATA;
+
+function el(id){ return document.getElementById(id); }
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function init(){
+  // meta
+  el('title').textContent = "Monthly Security Posture \u2014 " + D.meta.period;
+  el('meta').innerHTML =
+    `<div><b>${esc(D.meta.org)}</b></div>` +
+    `<div>Tenant: ${esc(D.meta.tenant)}</div>` +
+    `<div>Generated: ${esc(D.meta.generated)}</div>`;
+  el('genstamp').textContent = D.meta.generated;
+
+  // KPIs
+  const o = D.overall;
+  el('kpis').innerHTML = `
+    ${kpiCard('score','Secure Score', o.scorePct + '%', `${o.current} / ${o.max} pts`, ring(o.scorePct))}
+    ${kpiCard('crit','Critical', o.critical, 'open findings','')}
+    ${kpiCard('high','High', o.high, 'open findings','')}
+    ${kpiCard('med','Medium', o.medium, 'open findings','')}
+    ${kpiCard('inc','Open Incidents', o.openIncidents, 'Sentinel','')}`;
+
+  // risk badge
+  el('riskBadge').textContent = (o.critical + o.high);
+
+  // baseline
+  el('baseCount').textContent = D.baseline.length + ' controls';
+  el('baseBody').innerHTML = D.baseline.map(b =>
+    `<tr><td>${esc(b.control)}</td><td class="target">${b.target}</td><td class="note">${esc(b.rationale)}</td></tr>`).join('');
+
+  // subscription dropdown
+  el('subSelect').innerHTML =
+    `<option value="__all">All subscriptions (${D.subscriptions.length})</option>` +
+    D.subscriptions.map(s => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join('');
+
+  // sign-off dates
+  const now = new Date();
+  el('soDate').value = now.toISOString().slice(0,10);
+  const next = new Date(now); next.setMonth(next.getMonth()+1);
+  el('soNext').value = next.toISOString().slice(0,10);
+
+  renderRisks();
+  renderSignoff();
+}
+
+function kpiCard(cls,label,num,sub,ring){
+  return `<div class="kpi ${cls}"><div class="label">${label}</div><div class="num">${num}</div><div class="sub">${sub}</div>${ring}</div>`;
+}
+function ring(pct){
+  const r=18,c=2*Math.PI*r,off=c*(1-pct/100);
+  const col = pct>=80?'var(--ok)':pct>=60?'var(--med)':'var(--crit)';
+  return `<svg class="ring" viewBox="0 0 42 42"><circle cx="21" cy="21" r="${r}" fill="none" stroke="var(--line)" stroke-width="4"/>`+
+    `<circle cx="21" cy="21" r="${r}" fill="none" stroke="${col}" stroke-width="4" stroke-linecap="round" `+
+    `stroke-dasharray="${c}" stroke-dashoffset="${off}" transform="rotate(-90 21 21)"/></svg>`;
+}
+
+function renderRisks(){
+  const subId = el('subSelect').value;
+  const minSev = parseInt(el('sevFilter').value,10);
+  const subs = subId === '__all' ? D.subscriptions : D.subscriptions.filter(s => s.id === subId);
+
+  // sub score
+  if(subId === '__all'){
+    el('subScore').innerHTML = `Overall <b>${D.overall.scorePct}%</b>`;
+  } else {
+    const s = subs[0];
+    el('subScore').innerHTML = `${esc(s.name)} <b>${s.scorePct}%</b> <span style="color:var(--faint)">(${s.current}/${s.max})</span>`;
+  }
+
+  // issues
+  let issues = [];
+  subs.forEach(s => s.issues.forEach(i => issues.push(Object.assign({sub:s.name}, i))));
+  issues = issues.filter(i => i.sev >= minSev).sort((a,b)=>b.sev-a.sev);
+  el('issueCount').textContent = issues.length + ' findings';
+  el('issueBody').innerHTML = issues.length ? issues.map(i =>
+    `<tr><td><span class="res">${esc(i.resource)}</span><span class="restype">${esc(i.type)}${subId==='__all'?' \u00b7 '+esc(i.sub):''}</span></td>`+
+    `<td>${esc(i.rec)}</td><td class="note">${esc(i.control)}</td>`+
+    `<td><span class="pill sev-${i.sevName}">${i.sevName}</span></td>`+
+    `<td class="note">${esc(i.status)}</td></tr>`).join('')
+    : `<tr><td colspan="5" class="empty">No findings at this severity \u2705</td></tr>`;
+
+  // incidents
+  let incs = [];
+  subs.forEach(s => s.incidents.forEach(c => incs.push(Object.assign({sub:s.name}, c))));
+  incs.sort((a,b)=> (SEV_ORDER[b.severity]||0)-(SEV_ORDER[a.severity]||0));
+  el('incCount').textContent = incs.length + ' open';
+  el('incBody').innerHTML = incs.length ? incs.map(c =>
+    `<tr><td class="res">${esc(c.number)}</td><td>${esc(c.title)}${subId==='__all'?' <span class="restype">'+esc(c.sub)+'</span>':''}</td>`+
+    `<td><span class="pill sev-${c.severity}">${c.severity}</span></td>`+
+    `<td class="note">${esc(c.status)}</td><td class="note">${esc(c.created)}</td></tr>`).join('')
+    : `<tr><td colspan="5" class="empty">No open incidents \u2705</td></tr>`;
+}
+
+function renderSignoff(){
+  const rows = D.subscriptions.map(s => {
+    const top = [...s.issues].sort((a,b)=>b.sev-a.sev)[0];
+    return { sub:s.name, top: top?top.rec:'\u2014', sev: top?top.sevName:'Low' };
+  });
+  el('soCount').textContent = rows.length + ' subscriptions';
+  el('soBody').innerHTML = rows.map(r =>
+    `<tr><td><span class="res">${esc(r.sub)}</span></td><td>${esc(r.top)}</td>`+
+    `<td><span class="pill sev-${r.sev}">${r.sev}</span></td>`+
+    `<td class="note">Pending review</td></tr>`).join('');
+}
+
+function signOff(){
+  const name = el('soName').value.trim() || '[name required]';
+  const date = el('soDate').value;
+  el('soStamp').innerHTML = `\u2713 Signed by <b style="color:var(--ink)">${esc(name)}</b> on ${esc(date)}`;
+  el('soStamp').style.color = 'var(--ok)';
+}
+
+// tabs
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.panel-view').forEach(x=>x.classList.remove('active'));
+  t.classList.add('active');
+  el('view-' + t.dataset.view).classList.add('active');
+}));
+
+init();
+</script>
+</body>
+</html>
