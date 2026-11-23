@@ -1,0 +1,19 @@
+Build a Cloud Exposure Brief from scratch in this empty workspace. No starter files, JSON exports, or templates exist. Create everything needed for a first run.
+
+Keep the project small:
+- `report.py` — one Python entry point that validates the input, compares it with the previous snapshot, and generates the report. Embed the HTML, CSS, and JavaScript in this file.
+- `config.example.json` — the only configuration template I need to copy and fill in. Include placeholders for Wiz project IDs, Azure subscription IDs, AWS account IDs, environments, CVE watchlist, ACR subscription and registry name, and ACR repository paths.
+- `README.md` — exact steps for generating a demo, configuring my environment, and refreshing the live report.
+- `.gitignore` — exclude my filled-in configuration, collected data, history, and generated reports.
+
+Create a self-contained blue HTML report that management can open offline in Chrome or Safari. Put one exposure summary at the top, followed by daily changes and a findings table with search and CVE, cloud, and status filters. Add a compact “Available base images” sidebar to the right of the table on desktop, and above the table on narrow screens. Use no external assets, no live browser queries, and no chat or prompt box.
+
+For the live refresh:
+1. Use my connected Wiz MCP in read-only mode. Inspect the tools and their actual schemas. Fetch all available pages and statuses for my configured CVEs and scope. Preserve stable finding and resource IDs, package and version details, severity, source status, timestamps, and source links where available. Export the data to a local snapshot that `report.py` can read. Define and document its schema as part of this project.
+2. Use my signed-in Azure CLI to read tags and digests from the configured ACR repositories. Show a dropdown of available versioned images, tag update times, digest-pinned image references, and a link to the registry. Label the latest observed tag by update time. Show approval or mitigation for a selected CVE only when there is explicit evidence for that exact image digest. Otherwise show “Not verified.”
+3. Compare successful Wiz snapshots using stable finding and resource IDs. Show newly observed, still open, and confirmed resolved findings. If a previously tracked finding is missing, show it as unconfirmed. Use Wiz’s resolution timestamp when available. If only the transition was observed, label the time “Resolution first observed.” Keep history separate for different scopes.
+4. Generate `output/latest.html` only after validating a complete snapshot. Preserve the previous successful report and history if collection fails. Keep collection read-only and all outputs local. Never embed credentials in the report or repository.
+
+Build and test demo mode first with fictional Azure, AWS, Wiz, and ACR data. Generate `output/demo.html` so I can inspect the full layout immediately without cloud credentials. Demo mode must use separate state from live runs.
+
+Then tell me exactly which values to fill in and give me one short Cursor instruction I can reuse to refresh the report. If Wiz MCP or Azure access is unavailable, finish the demo and identify the specific live collection step that is blocked. Do not invent tool names, fields, or live findings.
